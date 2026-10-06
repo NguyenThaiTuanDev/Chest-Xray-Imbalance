@@ -1,9 +1,10 @@
 import os
 import argparse
 import torch
+import torch.nn as nn
 import numpy as np
 from torch.utils.data import DataLoader
-from torch.amp import GradScaler # Cập nhật import mới của PyTorch
+from torch.amp import GradScaler 
 
 # Import custom modules
 from src.data.dataset import VinDrCXRDataset
@@ -11,7 +12,6 @@ from src.data.transforms import get_transforms
 from src.models.builder import build_model
 from src.losses.losses import BCELoss, WBCELoss, FocalLossMultiLabel, AsymmetricLoss
 from src.engine.trainer import train_one_epoch, validate
-from src.engine.metrics import evaluate_metrics
 
 def seed_everything(seed=42):
     torch.manual_seed(seed)
@@ -43,7 +43,16 @@ def calculate_pos_weights(df, mode):
 def main(args):
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     print(f"\n🚀 Khởi chạy trên thiết bị: {device.type.upper()}")
+    
+    # ==========================================
+    # KHAI THÁC MULTI-GPU (T4x2) TRÊN KAGGLE
+    # ==========================================
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        print(f"🔥 TUYỆT VỜI! Phát hiện {num_gpus} GPUs. Đang bật chế độ DataParallel...")
+    
     print(f"📊 Cấu hình: Batch={args.batch_size}, Accumulate={args.accum_steps} -> Thực tế={args.batch_size * args.accum_steps}")
     
     # 1. DATASETS & DATALOADERS
@@ -58,12 +67,18 @@ def main(args):
         img_dir=os.path.join(args.data_dir, "images_train_512"),
         transform=get_transforms('val')
     )
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
     
-    # 2. MODEL
-    model = build_model(model_name='densenet201', num_classes=14, pretrained=True).to(device)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # 2. MODEL & DATAPARALLEL
+    model = build_model(model_name='densenet201', num_classes=14, pretrained=True)
+    
+    # Nếu có 2 GPU, bọc model lại để tự động chia batch size
+    if num_gpus > 1:
+        model = nn.DataParallel(model)
+        
+    model = model.to(device)
     
     # 3. LOSS FUNCTION
     if args.loss == 'bce':
@@ -82,7 +97,7 @@ def main(args):
         
     # 4. OPTIMIZER & SCALER
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scaler = GradScaler('cuda') # Cập nhật chuẩn GradScaler mới
+    scaler = GradScaler('cuda') 
     
     # 5. TRAINING LOOP
     best_map = 0.0
@@ -101,7 +116,10 @@ def main(args):
         if val_map > best_map:
             best_map = val_map
             save_path = f"outputs/checkpoints/best_{args.loss}_seed{args.seed}.pth"
-            torch.save(model.state_dict(), save_path)
+            
+            # Lưu ý khi dùng DataParallel: Phải lấy model.module để lưu, nếu không file weights sẽ bị dư chữ 'module.'
+            model_to_save = model.module if hasattr(model, 'module') else model
+            torch.save(model_to_save.state_dict(), save_path)
             print(f"   🔥 Đã lưu model tốt nhất (mAP: {best_map:.4f})")
     print("="*50 + "\n")
 
@@ -109,9 +127,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default=r"data/processed")
     parser.add_argument('--loss', type=str, default='bce', choices=['bce', 'wbce', 'focal', 'asl'])
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch_size', type=int, default=4) 
-    parser.add_argument('--accum_steps', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=15)
+    parser.add_argument('--batch_size', type=int, default=32) # Tăng mặc định lên 32 cho T4x2
+    parser.add_argument('--accum_steps', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--wbce_mode', type=int, default=1, choices=[1, 2, 3])
