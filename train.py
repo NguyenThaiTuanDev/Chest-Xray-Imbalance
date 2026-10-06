@@ -6,12 +6,12 @@ from torch.utils.data import DataLoader
 from torch.amp import GradScaler # Cập nhật import mới của PyTorch
 
 # Import custom modules
-from src.dataset import VinDrCXRDataset
-from src.transforms import get_transforms
-from src.builder import build_model
-from src.losses import BCELoss, WBCELoss, FocalLossMultiLabel, AsymmetricLoss
-from src.trainer import train_one_epoch, validate
-from src.metrics import evaluate_metrics
+from src.data.dataset import VinDrCXRDataset
+from src.data.transforms import get_transforms
+from src.models.builder import build_model
+from src.losses.losses import BCELoss, WBCELoss, FocalLossMultiLabel, AsymmetricLoss
+from src.engine.trainer import train_one_epoch, validate
+from src.engine.metrics import evaluate_metrics
 
 def seed_everything(seed=42):
     torch.manual_seed(seed)
