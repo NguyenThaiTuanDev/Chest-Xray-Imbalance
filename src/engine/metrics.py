@@ -26,7 +26,7 @@ def find_optimal_thresholds(y_true, y_prob):
             
     return np.array(best_thresholds)
 
-def evaluate_metrics(y_true, y_prob):
+def evaluate_metrics(y_true, y_prob, thresholds=None):  # <--- THÊM thresholds=None Ở ĐÂY
     """Tính toán an toàn, bỏ qua các class không có Positive samples"""
     num_classes = y_true.shape[1]
     auc_list = []
@@ -45,9 +45,11 @@ def evaluate_metrics(y_true, y_prob):
     mAP = np.mean(ap_list) if len(ap_list) > 0 else 0.0
 
     # F1-Score với Optimal Thresholds
-    optimal_thresholds = find_optimal_thresholds(y_true, y_prob)
-    y_pred = (y_prob >= optimal_thresholds).astype(int)
+    if thresholds is None: # <--- THÊM ĐOẠN IF NÀY
+        thresholds = find_optimal_thresholds(y_true, y_prob)
+        
+    y_pred = (y_prob >= thresholds).astype(int)
     
     f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
     
-    return macro_auc, mAP, f1_macro, optimal_thresholds
+    return macro_auc, mAP, f1_macro, thresholds
