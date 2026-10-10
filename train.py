@@ -13,7 +13,7 @@ from src.models.builder import build_model
 from src.losses.losses import BCELoss, WBCELoss, FocalLossMultiLabel, AsymmetricLoss
 from src.engine.trainer import train_one_epoch, validate
 
-def seed_everything(seed=42):
+def seed_everything(seed=132):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
