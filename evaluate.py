@@ -1,87 +1,132 @@
 import os
-import argparse
+import glob
 import torch
 import numpy as np
-from torch.utils.data import DataLoader
+import pandas as pd
 from tqdm import tqdm
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score
+from torch.utils.data import DataLoader
 
+# 1. IMPORT TỪ CÁC MODULE BÊN TRONG THƯ MỤC SRC
 from src.data.dataset import VinDrCXRDataset
 from src.data.transforms import get_transforms
 from src.models.builder import build_model
-from src.engine.metrics import evaluate_metrics, find_optimal_thresholds
 
-@torch.no_grad()
-def get_predictions(model, dataloader, device):
-    model.eval()
-    all_targets = []
-    all_probs = []
+# 2. CÁC HÀM BỔ TRỢ CHO QUÁ TRÌNH EVALUATE
+def clean_state_dict(state_dict):
+    """Xóa tiền tố 'module.' nếu model được train bằng nn.DataParallel"""
+    return {k.replace("module.", "") if k.startswith("module.") else k: v for k, v in state_dict.items()}
+
+def find_optimal_threshold(y_true, y_prob):
+    """Tìm ngưỡng (threshold) mang lại F1-Score cao nhất cho 1 class"""
+    precisions, recalls, thresholds = precision_recall_curve(y_true, y_prob)
+    best_f1, best_thresh = 0.0, 0.5
     
-    pbar = tqdm(dataloader, desc="Predicting")
-    for images, targets in pbar:
-        images = images.to(device)
-        # Bật autocast cho lúc inference để chạy nhanh hơn
-        with torch.amp.autocast('cuda'):
-            logits = model(images)
-            probs = torch.sigmoid(logits)
+    for precision, recall, threshold in zip(precisions, recalls, thresholds):
+        if precision + recall == 0:
+            continue
+        f1 = 2 * (precision * recall) / (precision + recall)
+        if f1 > best_f1:
+            best_f1, best_thresh = f1, threshold
             
-        all_targets.append(targets.cpu())
-        all_probs.append(probs.cpu())
-        
-    return torch.cat(all_targets).numpy(), torch.cat(all_probs).numpy()
+    return best_thresh, best_f1
 
-def main(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n🚀 Đang chạy Evaluation trên thiết bị: {device}")
+def evaluate_model(model, dataloader, device):
+    """Tiến hành inference trên toàn bộ tập Test"""
+    model.eval()
+    y_true_all, y_prob_all = [], []
     
-    # 1. LOAD DATASETS (Val để tìm Threshold, Test để đánh giá)
-    val_dataset = VinDrCXRDataset(
-        csv_file=os.path.join(args.data_dir, "labels", "val_split.csv"),
-        img_dir=os.path.join(args.data_dir, "images_train_512"),
-        transform=get_transforms('val')
-    )
+    with torch.no_grad():
+        for inputs, targets in tqdm(dataloader, desc="Evaluating", leave=False):
+            inputs = inputs.to(device)
+            outputs = model(inputs) 
+            probs = torch.sigmoid(outputs).cpu().numpy() # Multi-label Sigmoid
+            
+            y_prob_all.append(probs)
+            y_true_all.append(targets.cpu().numpy())
+            
+    return np.vstack(y_true_all), np.vstack(y_prob_all)
+
+# 3. KỊCH BẢN CHÍNH
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[*] Khởi động quá trình đánh giá trên thiết bị: {device}")
+    
+    # --- A. ĐƯỜNG DẪN CONFIG ---
+    test_csv_path  = "data/processed/labels/test_labels.csv"
+    test_img_dir   = "data/processed/images_test_512"
+    checkpoint_dir = "outputs/checkpoints"
+    output_csv     = "outputs/evaluation_results.csv"
+
+    # --- B. KHỞI TẠO DATASET & DATALOADER ---
+    print("[*] Load Dataset & Transforms...")
+    # Gọi hàm từ transforms.py
+    test_transform = get_transforms(phase='test')
+    
+    # Gọi class từ dataset.py
     test_dataset = VinDrCXRDataset(
-        csv_file=os.path.join(args.data_dir, "labels", "test_labels.csv"),
-        img_dir=os.path.join(args.data_dir, "images_test_512"),
-        transform=get_transforms('test')
+        csv_file=test_csv_path, 
+        img_dir=test_img_dir, 
+        transform=test_transform
     )
-    
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
-    
-    # 2. LOAD MODEL & TRỌNG SỐ
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+    # --- C. KHỞI TẠO MẠNG (BACKBONE) ---
+    print("[*] Build Model...")
     model = build_model(model_name='densenet201', num_classes=14, pretrained=False)
-    
-    if not os.path.exists(args.weights):
-        raise FileNotFoundError(f"Không tìm thấy file weights tại {args.weights}")
-        
-    model.load_state_dict(torch.load(args.weights, map_location=device))
     model = model.to(device)
-    print(f"✅ Đã load trọng số thành công từ: {args.weights}")
     
-    # 3. TÌM NGƯỠNG TỐI ƯU TRÊN TẬP VALIDATION
-    print("\nBước 1: Tìm Ngưỡng tối ưu trên tập Validation...")
-    y_val_true, y_val_prob = get_predictions(model, val_loader, device)
-    optimal_thresholds = find_optimal_thresholds(y_val_true, y_val_prob)
+    # --- D. QUÉT CHECKPOINTS & CHẠY EVALUATE ---
+    ckpt_paths = glob.glob(os.path.join(checkpoint_dir, "*.pth"))
+    ckpt_paths.sort() 
     
-    # 4. ĐÁNH GIÁ TRÊN TẬP TEST
-    print("\nBước 2: Dự đoán và Đánh giá trên tập TEST...")
-    y_test_true, y_test_prob = get_predictions(model, test_loader, device)
+    if not ckpt_paths:
+        print(f"[!] Không tìm thấy checkpoint nào tại {checkpoint_dir}")
+        return
+
+    results = []
     
-    test_auc, test_map, test_f1, _ = evaluate_metrics(y_test_true, y_test_prob, thresholds=optimal_thresholds)
-    
-    print("\n" + "="*50)
-    print(f"KẾT QUẢ ĐÁNH GIÁ TRÊN TẬP TEST (3000 ảnh) - MODEL: {args.weights.split('/')[-1]}")
-    print("="*50)
-    print(f"🔥 Macro-AUC : {test_auc:.4f}")
-    print(f"🔥 mAP (PR-AUC): {test_map:.4f}")
-    print(f"🔥 Macro-F1  : {test_f1:.4f}")
-    print("="*50 + "\n")
+    for ckpt in ckpt_paths:
+        ckpt_name = os.path.basename(ckpt)
+        print(f"\n---> Đang xử lý Checkpoint: {ckpt_name}")
+        
+        # Load weights
+        state_dict = torch.load(ckpt, map_location=device)
+        model.load_state_dict(clean_state_dict(state_dict))
+        
+        # Chạy inference
+        y_true, y_prob = evaluate_model(model, test_loader, device)
+        
+        # Tính ROC-AUC và PR-AUC
+        try:
+            macro_roc_auc = roc_auc_score(y_true, y_prob, average='macro')
+            macro_pr_auc = average_precision_score(y_true, y_prob, average='macro') 
+        except ValueError:
+            macro_roc_auc, macro_pr_auc = 0, 0
+            
+        # Tìm ngưỡng tối ưu cho 14 bệnh lý
+        f1_scores_opt = []
+        for i in range(14):
+            if np.sum(y_true[:, i]) == 0: continue # Bỏ qua nếu class ko có trong test set
+            opt_thresh, _ = find_optimal_threshold(y_true[:, i], y_prob[:, i])
+            y_pred_bin = (y_prob[:, i] >= opt_thresh).astype(int)
+            f1_scores_opt.append(f1_score(y_true[:, i], y_pred_bin, zero_division=0))
+            
+        macro_f1_opt = np.mean(f1_scores_opt) if f1_scores_opt else 0
+        
+        # Ghi nhận kết quả
+        results.append({
+            "Checkpoint": ckpt_name,
+            "Macro_ROC_AUC": round(macro_roc_auc, 4),
+            "Macro_PR_AUC_mAP": round(macro_pr_auc, 4),
+            "Macro_F1_OptThresh": round(macro_f1_opt, 4)
+        })
+        
+    # --- E. XUẤT KẾT QUẢ CSV ---
+    df_results = pd.DataFrame(results)
+    df_results.to_csv(output_csv, index=False)
+    print(f" ĐÃ HOÀN THÀNH! Kết quả chi tiết lưu tại: {output_csv}")
+    print(df_results.to_markdown(index=False))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, required=True, help="Đường dẫn đến thư mục processed")
-    parser.add_argument('--weights', type=str, required=True, help="Đường dẫn file .pth cần test")
-    parser.add_argument('--batch_size', type=int, default=32)
-    
-    args = parser.parse_args()
-    main(args)
+    main()
