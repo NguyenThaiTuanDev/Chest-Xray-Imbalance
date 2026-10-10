@@ -74,7 +74,6 @@ def main(args):
     # 2. MODEL & DATAPARALLEL
     model = build_model(model_name='densenet201', num_classes=14, pretrained=True)
     
-    # Nếu có 2 GPU, bọc model lại để tự động chia batch size
     if num_gpus > 1:
         model = nn.DataParallel(model)
         
@@ -115,12 +114,11 @@ def main(args):
         
         if val_map > best_map:
             best_map = val_map
-            save_path = f"outputs/checkpoints/best_{args.loss}_seed{args.seed}.pth"
+            save_path = f"outputs/checkpoints/best_{args.config_name}_seed{args.seed}.pth"
             
-            # Lưu ý khi dùng DataParallel: Phải lấy model.module để lưu, nếu không file weights sẽ bị dư chữ 'module.'
             model_to_save = model.module if hasattr(model, 'module') else model
             torch.save(model_to_save.state_dict(), save_path)
-            print(f"   🔥 Đã lưu model tốt nhất (mAP: {best_map:.4f})")
+            print(f"   🔥 Đã lưu model tốt nhất (mAP: {best_map:.4f}) vào {save_path}")
     print("="*50 + "\n")
 
 if __name__ == '__main__':
@@ -128,7 +126,7 @@ if __name__ == '__main__':
     parser.add_argument('--data_dir', type=str, default=r"data/processed")
     parser.add_argument('--loss', type=str, default='bce', choices=['bce', 'wbce', 'focal', 'asl'])
     parser.add_argument('--epochs', type=int, default=15)
-    parser.add_argument('--batch_size', type=int, default=32) # Tăng mặc định lên 32 cho T4x2
+    parser.add_argument('--batch_size', type=int, default=32) 
     parser.add_argument('--accum_steps', type=int, default=1)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--seed', type=int, default=42)
@@ -138,6 +136,8 @@ if __name__ == '__main__':
     parser.add_argument('--gamma_pos', type=float, default=0.0)
     parser.add_argument('--gamma_neg', type=float, default=4.0)
     parser.add_argument('--margin', type=float, default=0.05)
+    
+    parser.add_argument('--config_name', type=str, default='bce')
     
     args = parser.parse_args()
     main(args)
