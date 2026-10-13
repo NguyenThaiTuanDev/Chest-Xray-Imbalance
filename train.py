@@ -6,14 +6,20 @@ import numpy as np
 from torch.utils.data import DataLoader
 from torch.amp import GradScaler 
 
-# Import custom modules
+# ==========================================
+# IMPORT CUSTOM MODULES CỦA BẠN
+# ==========================================
 from src.data.dataset import VinDrCXRDataset
 from src.data.transforms import get_transforms
 from src.models.builder import build_model
 from src.losses.losses import BCELoss, WBCELoss, FocalLossMultiLabel, AsymmetricLoss
 from src.engine.trainer import train_one_epoch, validate
 
+# ==========================================
+# CÁC HÀM BỔ TRỢ
+# ==========================================
 def seed_everything(seed=132):
+    """Cố định seed để đảm bảo tính tái lập (Reproducibility)"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -22,11 +28,12 @@ def seed_everything(seed=132):
     np.random.seed(seed)
 
 def calculate_pos_weights(df, mode):
+    """Tính toán trọng số nhãn cho hàm Weighted BCE"""
     target_classes = df.columns[1:15]
     pos_counts = df[target_classes].sum().values
     neg_counts = len(df) - pos_counts
     
-    pos_counts[pos_counts == 0] = 1 
+    pos_counts[pos_counts == 0] = 1 # Tránh chia cho 0
     ratio = neg_counts / pos_counts
     
     if mode == 1:
@@ -40,22 +47,33 @@ def calculate_pos_weights(df, mode):
         
     return torch.tensor(w, dtype=torch.float32)
 
+# ==========================================
+# CHƯƠNG TRÌNH CHÍNH
+# ==========================================
 def main(args):
+    # 1. Cố định Seed
     seed_everything(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     print(f"\n🚀 Khởi chạy trên thiết bị: {device.type.upper()}")
     
-    # ==========================================
-    # KHAI THÁC MULTI-GPU (T4x2) TRÊN KAGGLE
-    # ==========================================
+    # 2. TỐI ƯU HÓA GPU (L4 / A100 - Bật TF32)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"🔥 Đang sử dụng GPU: {gpu_name}")
+        if "A100" in gpu_name or "L4" in gpu_name:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("⚡ Đã bật công nghệ TensorFloat-32 (TF32) để ép xung tốc độ huấn luyện tối đa!")
+
+    # 3. XỬ LÝ ĐA GPU (Multi-GPU)
     num_gpus = torch.cuda.device_count()
     if num_gpus > 1:
-        print(f"🔥 TUYỆT VỜI! Phát hiện {num_gpus} GPUs. Đang bật chế độ DataParallel...")
+        print(f"🔥 TUYỆT VỜI! Phát hiện {num_gpus} GPUs. Đang bật chế độ DataParallel (Chia tải GPU)...")
     
-    print(f"📊 Cấu hình: Batch={args.batch_size}, Accumulate={args.accum_steps} -> Thực tế={args.batch_size * args.accum_steps}")
+    print(f"📊 Cấu hình: Batch={args.batch_size}, Accumulate={args.accum_steps} -> Thực tế cập nhật ={args.batch_size * args.accum_steps}")
     
-    # 1. DATASETS & DATALOADERS
+    # 4. DATASETS & DATALOADERS
     train_dataset = VinDrCXRDataset(
         csv_file=os.path.join(args.data_dir, "labels", "train_split.csv"),
         img_dir=os.path.join(args.data_dir, "images_train_512"),
@@ -71,7 +89,7 @@ def main(args):
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=4, pin_memory=True)
     
-    # 2. MODEL & DATAPARALLEL
+    # 5. KHỞI TẠO MODEL
     model = build_model(model_name='densenet201', num_classes=14, pretrained=True)
     
     if num_gpus > 1:
@@ -79,7 +97,7 @@ def main(args):
         
     model = model.to(device)
     
-    # 3. LOSS FUNCTION
+    # 6. THIẾT LẬP HÀM MẤT MÁT (LOSS FUNCTION)
     if args.loss == 'bce':
         criterion = BCELoss()
         print("🎯 Hàm Mất mát: BCE (Baseline)")
@@ -94,11 +112,11 @@ def main(args):
         criterion = AsymmetricLoss(gamma_pos=args.gamma_pos, gamma_neg=args.gamma_neg, margin=args.margin)
         print(f"🎯 Hàm Mất mát: ASL (gamma_+={args.gamma_pos}, gamma_-={args.gamma_neg}, margin={args.margin})")
         
-    # 4. OPTIMIZER & SCALER
+    # 7. OPTIMIZER & MIXED PRECISION SCALER
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = GradScaler('cuda') 
     
-    # 5. TRAINING LOOP
+    # 8. TRAINING LOOP (VÒNG LẶP HUẤN LUYỆN)
     best_map = 0.0
     os.makedirs('outputs/checkpoints', exist_ok=True)
     
@@ -106,21 +124,31 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         print(f"Epoch {epoch}/{args.epochs}")
         
+        # Train & Val
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device, args.accum_steps)
         val_loss, val_auc, val_map, val_f1 = validate(model, val_loader, criterion, device)
         
         print(f"   Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
         print(f"   Macro-AUC:  {val_auc:.4f} | mAP: {val_map:.4f} | Macro-F1: {val_f1:.4f}")
         
+        # Lưu Checkpoint nếu mAP cao nhất
         if val_map > best_map:
             best_map = val_map
+            
+            # Sử dụng args.config_name để lưu tên chuẩn xác, tránh bị ghi đè
             save_path = f"outputs/checkpoints/best_{args.config_name}_seed{args.seed}.pth"
             
+            # Loại bỏ DataParallel prefix 'module.' trước khi lưu
             model_to_save = model.module if hasattr(model, 'module') else model
             torch.save(model_to_save.state_dict(), save_path)
+            
             print(f"   🔥 Đã lưu model tốt nhất (mAP: {best_map:.4f}) vào {save_path}")
+            
     print("="*50 + "\n")
 
+# ==========================================
+# ENTRY POINT CỦA SCRIPT
+# ==========================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default=r"data/processed")
@@ -137,7 +165,8 @@ if __name__ == '__main__':
     parser.add_argument('--gamma_neg', type=float, default=4.0)
     parser.add_argument('--margin', type=float, default=0.05)
     
-    parser.add_argument('--config_name', type=str, default='bce')
+    # Biến tên file để lưu cấu hình
+    parser.add_argument('--config_name', type=str, default='bce', help="Tên cấu hình để lưu file checkpoint")
     
     args = parser.parse_args()
     main(args)

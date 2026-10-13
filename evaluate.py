@@ -55,7 +55,7 @@ def main():
     # --- A. ĐƯỜNG DẪN CONFIG ---
     test_csv_path  = "data/processed/labels/test_labels.csv"
     test_img_dir   = "data/processed/images_test_512"
-    checkpoint_dir = "outputs/checkpoints"
+    checkpoint_dir = "outputs/checkpoints/seed3407"
     output_csv     = "outputs/evaluation_results.csv"
 
     # --- B. KHỞI TẠO DATASET & DATALOADER ---
