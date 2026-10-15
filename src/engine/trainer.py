@@ -22,14 +22,16 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, acc
         scaler.scale(loss).backward()
         
         if (step + 1) % accumulation_steps == 0 or (step + 1) == len(dataloader):
+            # unscale_ trước khi cắt tỉa
+            scaler.unscale_(optimizer)
+            
+            # Chặn trần gradient tối đa 1.0 chống nổ số
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Step an toàn
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad() 
-            
-        running_loss += loss.item() * accumulation_steps
-        pbar.set_postfix({'loss': f"{running_loss / (step + 1):.4f}"})
-        
-    return running_loss / len(dataloader)
+            optimizer.zero_grad()
 
 
 @torch.no_grad()
