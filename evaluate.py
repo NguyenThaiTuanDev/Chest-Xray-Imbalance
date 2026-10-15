@@ -55,15 +55,15 @@ def main():
     # --- A. ĐƯỜNG DẪN CONFIG ---
     test_csv_path  = "data/processed/labels/test_labels.csv"
     test_img_dir   = "data/processed/images_test_512"
-    checkpoint_dir = "outputs/checkpoints/seed3407"
-    output_csv     = "outputs/evaluation_results.csv"
+    
+    # TRỎ VÀO THƯ MỤC GỐC CHỨA CÁC SEED
+    base_checkpoint_dir = "outputs/checkpoints" 
+    output_csv          = "outputs/evaluation_results_all_seeds.csv"
 
     # --- B. KHỞI TẠO DATASET & DATALOADER ---
     print("[*] Load Dataset & Transforms...")
-    # Gọi hàm từ transforms.py
     test_transform = get_transforms(phase='test')
     
-    # Gọi class từ dataset.py
     test_dataset = VinDrCXRDataset(
         csv_file=test_csv_path, 
         img_dir=test_img_dir, 
@@ -76,19 +76,23 @@ def main():
     model = build_model(model_name='densenet201', num_classes=14, pretrained=False)
     model = model.to(device)
     
-    # --- D. QUÉT CHECKPOINTS & CHẠY EVALUATE ---
-    ckpt_paths = glob.glob(os.path.join(checkpoint_dir, "*.pth"))
+    # --- D. QUÉT CHECKPOINTS XUYÊN CÁC THƯ MỤC SEED ---
+    # Dùng recursive=True để tìm toàn bộ file .pth trong các thư mục con (seed42, seed132, seed3407)
+    ckpt_paths = glob.glob(os.path.join(base_checkpoint_dir, "**", "*.pth"), recursive=True)
     ckpt_paths.sort() 
     
     if not ckpt_paths:
-        print(f"[!] Không tìm thấy checkpoint nào tại {checkpoint_dir}")
+        print(f"[!] Không tìm thấy checkpoint nào trong {base_checkpoint_dir} và các thư mục con")
         return
 
+    print(f"\n[*] Đã tìm thấy tổng cộng {len(ckpt_paths)} checkpoints. Bắt đầu đánh giá...")
     results = []
     
     for ckpt in ckpt_paths:
         ckpt_name = os.path.basename(ckpt)
-        print(f"\n---> Đang xử lý Checkpoint: {ckpt_name}")
+        seed_folder = os.path.basename(os.path.dirname(ckpt)) # Lấy tên thư mục chứa (vd: seed42)
+        
+        print(f"\n---> Đang xử lý: [{seed_folder}] {ckpt_name}")
         
         # Load weights
         state_dict = torch.load(ckpt, map_location=device)
@@ -114,8 +118,9 @@ def main():
             
         macro_f1_opt = np.mean(f1_scores_opt) if f1_scores_opt else 0
         
-        # Ghi nhận kết quả
+        # Ghi nhận kết quả (Thêm cột Seed_Folder để dễ phân loại)
         results.append({
+            "Seed_Folder": seed_folder,
             "Checkpoint": ckpt_name,
             "Macro_ROC_AUC": round(macro_roc_auc, 4),
             "Macro_PR_AUC_mAP": round(macro_pr_auc, 4),
@@ -125,7 +130,10 @@ def main():
     # --- E. XUẤT KẾT QUẢ CSV ---
     df_results = pd.DataFrame(results)
     df_results.to_csv(output_csv, index=False)
+    
+    print(f"\n==========================================================")
     print(f" ĐÃ HOÀN THÀNH! Kết quả chi tiết lưu tại: {output_csv}")
+    print(f"==========================================================\n")
     print(df_results.to_markdown(index=False))
 
 if __name__ == "__main__":

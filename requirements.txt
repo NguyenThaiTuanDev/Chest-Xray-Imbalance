@@ -1,5 +1,26 @@
-pandas 
-scikit-learn 
-pydicom 
-opencv-python 
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# --- Core Deep Learning ---
+torch
+torchvision
+timm
+
+# --- Data Processing & Metrics ---
+numpy
+pandas
+scikit-learn
+pydicom
+
+# --- Image Processing & Augmentation ---
+opencv-python
+albumentations
+
+# --- Visualization & Explainable AI ---
+matplotlib
+seaborn
+grad-cam
+
+# --- Utilities & Environment ---
 tqdm
+jupyter
+tabulate
