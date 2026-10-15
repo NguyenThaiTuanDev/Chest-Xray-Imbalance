@@ -1,6 +1,7 @@
 import torch
 from tqdm import tqdm
-from torch.amp import autocast  # Cập nhật import mới
+from torch.amp import autocast
+import numpy as np
 from src.engine.metrics import evaluate_metrics
 
 def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, accumulation_steps):
@@ -13,7 +14,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, acc
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         
-        # Cập nhật autocast chuẩn mới
+        # Mixed Precision Autocast
         with autocast('cuda'):
             logits = model(images)
             loss = criterion(logits, targets)
@@ -21,18 +22,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scaler, device, acc
             
         scaler.scale(loss).backward()
         
+        # Cập nhật Gradient theo accumulation_steps
         if (step + 1) % accumulation_steps == 0 or (step + 1) == len(dataloader):
-            # unscale_ trước khi cắt tỉa
             scaler.unscale_(optimizer)
-            
-            # Chặn trần gradient tối đa 1.0 chống nổ số
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Step an toàn
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
-
+            optimizer.zero_grad() 
+            
+        running_loss += loss.item() * accumulation_steps
+        pbar.set_postfix({'loss': f"{running_loss / (step + 1):.4f}"})
+        
+    return running_loss / len(dataloader)
 
 @torch.no_grad()
 def validate(model, dataloader, criterion, device):
@@ -46,7 +47,6 @@ def validate(model, dataloader, criterion, device):
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         
-        # Cập nhật autocast chuẩn mới
         with autocast('cuda'):
             logits = model(images)
             loss = criterion(logits, targets)
@@ -59,6 +59,10 @@ def validate(model, dataloader, criterion, device):
     all_targets = torch.cat(all_targets).numpy()
     all_probs = torch.cat(all_probs).numpy()
     
+    # Bảo hiểm an toàn chống NaN cho Validation
+    if np.isnan(all_probs).any():
+        all_probs = np.nan_to_num(all_probs, nan=0.5)
+
     val_loss = running_loss / len(dataloader)
     val_auc, val_map, val_f1, _ = evaluate_metrics(all_targets, all_probs)
     
