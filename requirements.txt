@@ -10,6 +10,7 @@ numpy
 pandas
 scikit-learn
 pydicom
+scikit-multilearn
 
 # --- Image Processing & Augmentation ---
 opencv-python

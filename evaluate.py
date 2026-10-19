@@ -7,12 +7,12 @@ from tqdm import tqdm
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve, f1_score
 from torch.utils.data import DataLoader
 
-# 1. IMPORT TỪ CÁC MODULE BÊN TRONG THƯ MỤC SRC
+# 1. IMPORT TỪ CÁC MODULE SRC
 from src.data.dataset import VinDrCXRDataset
 from src.data.transforms import get_transforms
 from src.models.builder import build_model
 
-# 2. CÁC HÀM BỔ TRỢ CHO QUÁ TRÌNH EVALUATE
+# 2. CÁC HÀM BỔ TRỢ ĐÁNH GIÁ
 def clean_state_dict(state_dict):
     """Xóa tiền tố 'module.' nếu model được train bằng nn.DataParallel"""
     return {k.replace("module.", "") if k.startswith("module.") else k: v for k, v in state_dict.items()}
@@ -52,18 +52,24 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Khởi động quá trình đánh giá trên thiết bị: {device}")
     
-    # --- A. ĐƯỜNG DẪN CONFIG ---
+    # CẤU HÌNH ĐƯỜNG DẪN & TÙY CHỌN
     test_csv_path  = "data/processed/labels/test_labels.csv"
     test_img_dir   = "data/processed/images_test_512"
+    base_ckpt_dir  = "outputs/checkpoints"
     
-    # TRỎ VÀO THƯ MỤC GỐC CHỨA CÁC SEED
-    base_checkpoint_dir = "outputs/checkpoints" 
-    output_csv          = "outputs/evaluation_results_all_seeds.csv"
+    # Đặt True: Chỉ lọc các file Sanity check (a0, f0, w0, bce)
+    # Đặt False: Đánh giá TẤT CẢ các model trong các folder seed
+    ONLY_SANITY_CHECK = False  
+    
+    output_csv = "outputs/evaluation_sanity_check_3seeds.csv" if ONLY_SANITY_CHECK else "outputs/evaluation_all_3seeds.csv"
 
-    # --- B. KHỞI TẠO DATASET & DATALOADER ---
-    print("[*] Load Dataset & Transforms...")
+    # Danh sách 3 seeds mục tiêu cần quét
+    TARGET_SEEDS = [42, 132, 3407]
+    SANITY_KEYS = ['a0', 'f0', 'w0', 'bce']
+
+    # KHỞI TẠO DATASET & MODEL
+    print("[*] Load Dataset & DataLoader...")
     test_transform = get_transforms(phase='test')
-    
     test_dataset = VinDrCXRDataset(
         csv_file=test_csv_path, 
         img_dir=test_img_dir, 
@@ -71,69 +77,99 @@ def main():
     )
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
 
-    # --- C. KHỞI TẠO MẠNG (BACKBONE) ---
-    print("[*] Build Model...")
+    print("[*] Build Model DenseNet201...")
     model = build_model(model_name='densenet201', num_classes=14, pretrained=False)
     model = model.to(device)
     
-    # --- D. QUÉT CHECKPOINTS XUYÊN CÁC THƯ MỤC SEED ---
-    # Dùng recursive=True để tìm toàn bộ file .pth trong các thư mục con (seed42, seed132, seed3407)
-    ckpt_paths = glob.glob(os.path.join(base_checkpoint_dir, "**", "*.pth"), recursive=True)
-    ckpt_paths.sort() 
+    # QUÉT TÌM CHECKPOINTS TRONG CÁC THƯ MỤC SEED
+    ckpt_paths = []
     
+    for seed in TARGET_SEEDS:
+        # Tìm thư mục con dạng: seed42, seed_42, hoặc 42
+        seed_folder = os.path.join(base_ckpt_dir, f"seed{seed}")
+        if not os.path.exists(seed_folder):
+            seed_folder = os.path.join(base_ckpt_dir, str(seed))
+            
+        if os.path.exists(seed_folder):
+            files = glob.glob(os.path.join(seed_folder, "*.pth"))
+            ckpt_paths.extend(files)
+        else:
+            # Dự phòng: nếu file nằm ngay ngoài base_ckpt_dir nhưng có tên chứa seed
+            fallback_files = glob.glob(os.path.join(base_ckpt_dir, f"*seed{seed}*.pth"))
+            ckpt_paths.extend(fallback_files)
+
+    # Lọc Sanity Check nếu được bật
+    if ONLY_SANITY_CHECK:
+        ckpt_paths = [
+            p for p in ckpt_paths 
+            if any(k in os.path.basename(p).lower() for k in SANITY_KEYS)
+        ]
+        
+    ckpt_paths.sort()
+
     if not ckpt_paths:
-        print(f"[!] Không tìm thấy checkpoint nào trong {base_checkpoint_dir} và các thư mục con")
+        print(f"[!] Không tìm thấy checkpoint nào trong các thư mục seed {TARGET_SEEDS}")
         return
 
     print(f"\n[*] Đã tìm thấy tổng cộng {len(ckpt_paths)} checkpoints. Bắt đầu đánh giá...")
     results = []
-    
+
+    # VÒNG LẶP SUY LUẬN & ĐÁNH GIÁ
     for ckpt in ckpt_paths:
         ckpt_name = os.path.basename(ckpt)
-        seed_folder = os.path.basename(os.path.dirname(ckpt)) # Lấy tên thư mục chứa (vd: seed42)
+        parent_folder = os.path.basename(os.path.dirname(ckpt))
         
-        print(f"\n---> Đang xử lý: [{seed_folder}] {ckpt_name}")
-        
-        # Load weights
+        # Nhận diện seed từ tên folder hoặc tên file
+        detected_seed = "Unknown"
+        for s in TARGET_SEEDS:
+            if f"seed{s}" in parent_folder or f"seed{s}" in ckpt_name:
+                detected_seed = f"Seed_{s}"
+                break
+
+        print(f"\n---> Đang xử lý: [{detected_seed}] {ckpt_name}")
+
+        # Load trọng số an toàn
         state_dict = torch.load(ckpt, map_location=device)
         model.load_state_dict(clean_state_dict(state_dict))
-        
+
         # Chạy inference
         y_true, y_prob = evaluate_model(model, test_loader, device)
-        
-        # Tính ROC-AUC và PR-AUC
+
+        # Tính ROC-AUC và PR-AUC (mAP)
         try:
             macro_roc_auc = roc_auc_score(y_true, y_prob, average='macro')
-            macro_pr_auc = average_precision_score(y_true, y_prob, average='macro') 
+            macro_pr_auc = average_precision_score(y_true, y_prob, average='macro')
         except ValueError:
             macro_roc_auc, macro_pr_auc = 0, 0
-            
+
         # Tìm ngưỡng tối ưu cho 14 bệnh lý
         f1_scores_opt = []
         for i in range(14):
-            if np.sum(y_true[:, i]) == 0: continue # Bỏ qua nếu class ko có trong test set
+            if np.sum(y_true[:, i]) == 0: continue
             opt_thresh, _ = find_optimal_threshold(y_true[:, i], y_prob[:, i])
             y_pred_bin = (y_prob[:, i] >= opt_thresh).astype(int)
             f1_scores_opt.append(f1_score(y_true[:, i], y_pred_bin, zero_division=0))
-            
+
         macro_f1_opt = np.mean(f1_scores_opt) if f1_scores_opt else 0
-        
-        # Ghi nhận kết quả (Thêm cột Seed_Folder để dễ phân loại)
+
         results.append({
-            "Seed_Folder": seed_folder,
+            "Seed": detected_seed,
             "Checkpoint": ckpt_name,
             "Macro_ROC_AUC": round(macro_roc_auc, 4),
             "Macro_PR_AUC_mAP": round(macro_pr_auc, 4),
             "Macro_F1_OptThresh": round(macro_f1_opt, 4)
         })
-        
-    # --- E. XUẤT KẾT QUẢ CSV ---
+
+    # XUẤT VÀ IN KẾT QUẢ
     df_results = pd.DataFrame(results)
-    df_results.to_csv(output_csv, index=False)
     
-    print(f"\n==========================================================")
-    print(f" ĐÃ HOÀN THÀNH! Kết quả chi tiết lưu tại: {output_csv}")
-    print(f"==========================================================\n")
+    # Sắp xếp theo Seed và Checkpoint cho đẹp mắt
+    df_results = df_results.sort_values(by=['Seed', 'Checkpoint']).reset_index(drop=True)
+    
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df_results.to_csv(output_csv, index=False, encoding='utf-8-sig')
+
+    print(f" ĐÃ HOÀN THÀNH! Kết quả được lưu tại: {output_csv}")
     print(df_results.to_markdown(index=False))
 
 if __name__ == "__main__":
