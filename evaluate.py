@@ -53,7 +53,7 @@ def main():
     print(f"[*] Khởi động quá trình đánh giá trên thiết bị: {device}")
     
     # CHỈ CẦN SỬA THÔNG TIN Ở KHU VỰC NÀY KHI ĐỔI DATASET
-    dataset_name = "VinDr-PCXR"  # "VinDr-CXR", "VinDr-PCXR"
+    dataset_name = "VinDr-CXR"  # "VinDr-CXR", "VinDr-PCXR"
     num_classes  = 14            
     
     # Đường dẫn (Tự động thích ứng theo dataset_name)
@@ -61,7 +61,7 @@ def main():
     test_img_dir   = f"data/processed/{dataset_name}/test"
     
     base_checkpoint_dir = f"outputs/checkpoints/{dataset_name}" 
-    output_csv          = f"outputs/evaluation_results_{dataset_name}_all_seeds.csv"
+    output_csv          = f"outputs/csv/evaluation_results_{dataset_name}_all_seeds.csv"
 
     print(f"[*] Đang xử lý bộ dữ liệu: {dataset_name} | Số nhãn: {num_classes}")
 
