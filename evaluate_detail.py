@@ -48,7 +48,7 @@ def main():
     print(f"[*] Khởi động quá trình đánh giá trên thiết bị: {device}")
     
     # CHỈ CẦN ĐỔI TÊN BỘ DỮ LIỆU Ở ĐÂY ("VinDr-CXR" hoặc "VinDr-PCXR")
-    dataset_name = "VinDr-CXR" 
+    dataset_name = "VinDr-PCXR" 
     
     test_csv_path  = f"data/processed/{dataset_name}/labels/test_labels.csv"
     test_img_dir   = f"data/processed/{dataset_name}/test"
