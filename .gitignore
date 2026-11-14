@@ -1,0 +1,18 @@
+# Chặn các thư mục ở Root (ngoài cùng) chứa dữ liệu lớn và kết quả
+/data/
+/dummy_data/
+/outputs/
+/results/
+
+# Chặn không đưa requirements.txt lên Git
+requirements.txt
+
+# Chặn các file cache của Python ở mọi nơi
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Chặn các file rác của OS (Tùy chọn)
+.DS_Store
+Thumbs.db
