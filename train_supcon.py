@@ -1,9 +1,3 @@
-"""Stage 2 / Task 04A training entrypoint. Run from repository root.
-
-Does not read test files. Results and checkpoints are separate from Stage 1.
-Example:
- python train_supcon.py --dataset VinDr-CXR --seed 42 --epochs 1 --image-size 128 --batch-size 2 --max-train-batches 3 --max-val-batches 2 --no-pretrained
-"""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +6,7 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -182,14 +177,19 @@ def run(args):
     history=report_dir/'history.csv'
     patience_count=0
     for epoch in range(start_epoch,args.epochs+1):
+        epoch_start=time.perf_counter()
+        print(f'\n=== {args.dataset} | EPOCH {epoch}/{args.epochs} | TRAIN ===',flush=True)
         # Epoch-specific shuffle supports exact epoch-boundary resume.
         generator.manual_seed(args.seed + epoch)
         if device.type=='cuda':
             torch.cuda.reset_peak_memory_stats(device)
         tr=train_supcon_epoch(model,train_loader,cls_loss,con_loss,optimizer,scaler,device,
                               beta=args.beta,accumulation_steps=args.accumulation_steps,
-                              max_batches=args.max_train_batches,amp=amp,grad_clip=args.grad_clip)
-        val=validate_supcon(model,val_loader,cls_loss,device,amp=amp,max_batches=args.max_val_batches)
+                              max_batches=args.max_train_batches,amp=amp,grad_clip=args.grad_clip,
+                              epoch=epoch,total_epochs=args.epochs,progress_every=args.progress_every)
+        print(f'=== {args.dataset} | EPOCH {epoch}/{args.epochs} | VALIDATION ===',flush=True)
+        val=validate_supcon(model,val_loader,cls_loss,device,amp=amp,max_batches=args.max_val_batches,
+                            epoch=epoch,total_epochs=args.epochs,progress_every=args.progress_every)
         peak=(torch.cuda.max_memory_allocated(device)/1024**3) if device.type=='cuda' else None
         row=dict(epoch=epoch,train_loss=tr.loss,train_cls_loss=tr.classification_loss,
                  train_con_loss=tr.contrastive_loss,val_loss=val['val_loss'],
@@ -213,7 +213,8 @@ def run(args):
         print(f'Epoch {epoch}/{args.epochs}: loss={tr.loss:.4f} cls={tr.classification_loss:.4f} '
               f'con={tr.contrastive_loss:.4f} Val mAP={val["mAP"]:.4f} '
               f'valid={val["n_valid_classes"]}/14 queue={tr.valid_queue_at_end} '
-              f'VRAM_peak={peak if peak is not None else "CPU"} best={is_better}')
+              f'VRAM_peak={peak if peak is not None else "CPU"} best={is_better} '
+              f'epoch_seconds={time.perf_counter()-epoch_start:.1f}',flush=True)
         if args.patience and patience_count>=args.patience:
             print(f'Early stopping: no improvement for {patience_count} epochs')
             break
@@ -234,6 +235,7 @@ def arguments():
     p.add_argument('--accumulation-steps',type=int,default=8)
     p.add_argument('--image-size',type=int,default=512)
     p.add_argument('--num-workers',type=int,default=2)
+    p.add_argument('--progress-every',type=int,default=10,help='Update live tqdm metrics every N batches')
     p.add_argument('--proj-dim',type=int,default=128)
     p.add_argument('--queue-size',type=int,default=1024)
     p.add_argument('--momentum',type=float,default=0.999)

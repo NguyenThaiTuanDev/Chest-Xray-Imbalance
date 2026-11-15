@@ -1,9 +1,3 @@
-"""Stage 2 / Task 04A: multi-label momentum contrastive trainer.
-
-No test split is read here. The validation split is single-view, never enqueued.
-Queue receives detached momentum keys AFTER the current batch contrastive loss.
-EMA is updated once per *successful* optimizer step (not every microbatch).
-"""
 from __future__ import annotations
 
 from contextlib import nullcontext
@@ -12,6 +6,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, f1_score
 
 from src.engine.metrics import find_optimal_thresholds
@@ -42,7 +37,8 @@ class TrainResult:
 def train_supcon_epoch(model, loader, classifier_loss, contrastive_loss, optimizer, scaler,
                        device, beta: float, accumulation_steps: int = 1,
                        max_batches: Optional[int] = None, amp: bool = True,
-                       grad_clip: float = 1.0) -> TrainResult:
+                       grad_clip: float = 1.0, epoch: int | None = None,
+                       total_epochs: int | None = None, progress_every: int = 10) -> TrainResult:
     if accumulation_steps < 1 or beta < 0:
         raise ValueError('accumulation_steps >= 1 and beta >= 0 required')
     if max_batches is not None and max_batches < 1:
@@ -56,7 +52,10 @@ def train_supcon_epoch(model, loader, classifier_loss, contrastive_loss, optimiz
         count_batches = min(count_batches, max_batches)
     sums = {'loss': 0.0, 'cls': 0.0, 'con': 0.0, 'images': 0,
             'disease': 0, 'cross': 0, 'steps': 0, 'skipped': 0}
-    for i, (view_q, view_k, labels) in enumerate(loader):
+    desc = f"TRAIN {epoch}/{total_epochs}" if epoch is not None and total_epochs is not None else "TRAIN"
+    pbar = tqdm(loader, total=count_batches, desc=desc, unit="batch", dynamic_ncols=True,
+                mininterval=1.0, leave=True)
+    for i, (view_q, view_k, labels) in enumerate(pbar):
         if i >= count_batches:
             break
         view_q = view_q.to(device, non_blocking=True)
@@ -105,6 +104,16 @@ def train_supcon_epoch(model, loader, classifier_loss, contrastive_loss, optimiz
             else:
                 sums['skipped'] += 1
             optimizer.zero_grad(set_to_none=True)
+        if (i + 1) % max(1, progress_every) == 0 or i + 1 == count_batches:
+            mem = f"{torch.cuda.memory_allocated(device) / (1024**3):.2f}G" if device.type == 'cuda' else 'CPU'
+            pbar.set_postfix({
+                'loss': f"{sums['loss']/sums['images']:.4f}",
+                'bce': f"{sums['cls']/sums['images']:.4f}",
+                'supcon': f"{sums['con']/sums['images']:.4f}",
+                'queue': int(model.queue_count.item()),
+                'vram': mem,
+            }, refresh=False)
+    pbar.close()
     if sums['images'] == 0:
         raise RuntimeError('No images trained')
     return TrainResult(
@@ -119,7 +128,9 @@ def train_supcon_epoch(model, loader, classifier_loss, contrastive_loss, optimiz
 
 
 @torch.no_grad()
-def validate_supcon(model, loader, classifier_loss, device, amp=True, max_batches=None):
+def validate_supcon(model, loader, classifier_loss, device, amp=True, max_batches=None,
+                    epoch: int | None = None, total_epochs: int | None = None,
+                    progress_every: int = 10):
     """Val only: AP and AUC omit single-class labels; thresholds fitted to val only.
 
     Macro F1, precision, recall computed on same valid-class mask for stable
@@ -128,7 +139,11 @@ def validate_supcon(model, loader, classifier_loss, device, amp=True, max_batche
     model.eval()
     all_targets, all_scores = [], []
     loss_sum, n = 0.0, 0
-    for i, (images, labels) in enumerate(loader):
+    val_batches = min(len(loader), max_batches) if max_batches is not None else len(loader)
+    desc = f"VAL {epoch}/{total_epochs}" if epoch is not None and total_epochs is not None else "VAL"
+    pbar = tqdm(loader, total=val_batches, desc=desc, unit="batch", dynamic_ncols=True,
+                mininterval=1.0, leave=True)
+    for i, (images, labels) in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
         images = images.to(device, non_blocking=True)
@@ -143,6 +158,9 @@ def validate_supcon(model, loader, classifier_loss, device, amp=True, max_batche
         n += bs
         all_targets.append(labels.cpu().numpy())
         all_scores.append(probs.cpu().numpy())
+        if (i + 1) % max(1, progress_every) == 0 or i + 1 == val_batches:
+            pbar.set_postfix({'val_loss': f'{loss_sum/n:.4f}', 'images': n}, refresh=False)
+    pbar.close()
     if not n:
         raise ValueError('Validation loader yielded no samples')
     y_true = np.concatenate(all_targets, axis=0).astype(np.int64)
