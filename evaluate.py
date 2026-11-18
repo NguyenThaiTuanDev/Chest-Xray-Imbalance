@@ -1,23 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import re
 import sys
-import traceback
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, roc_auc_score
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, roc_auc_score, precision_score, recall_score, balanced_accuracy_score, confusion_matrix
 from torch.utils.data import DataLoader, Dataset
 from torchvision import models, transforms
 from tqdm.auto import tqdm
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 DEFAULT_LABELS = {
     "VinDr-CXR": [
@@ -42,9 +42,12 @@ AVOID_TOKENS = ("latest", "last", "final_epoch", "optimizer", "scheduler")
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--data-root", type=Path, default=Path("data"))
-    p.add_argument("--checkpoints-root", type=Path, default=Path("checkpoints"))
-    p.add_argument("--output-dir", type=Path, default=Path("results/evaluation"))
+    p.add_argument("--data-root", type=Path, default=Path("data/processed"))
+    p.add_argument("--checkpoints-root", type=Path, default=Path("outputs/stage1/checkpoints"))
+    p.add_argument("--output-dir", type=Path, default=Path("outputs/stage1"), help="Stage-1 output root containing csv/ and visualizations/")
+    p.add_argument("--flow", choices=["main", "detail", "both"], default="both", help="main: major metrics; detail: per-label metrics + figures; both: one inference pass")
+    p.add_argument("--output-prefix", default="eval_", help="Prefix for generated CSV/PNG names; default avoids overwriting prior Stage-1 reports")
+    p.add_argument("--expected-models", type=int, default=14, help="Expected Stage-1 loss configurations per dataset/seed for strict coverage")
     p.add_argument("--datasets", nargs="+", default=["VinDr-CXR", "VinDr-PCXR"], choices=list(DEFAULT_LABELS))
     p.add_argument("--seeds", nargs="+", type=int, default=[7, 42, 132, 2024, 3407])
     p.add_argument("--labels-json", type=Path, help="JSON map: dataset name -> ordered list of 14 class names")
@@ -72,9 +75,21 @@ def load_labels(args):
 class XrayCSV(Dataset):
     def __init__(self, root: Path, split: str, labels: list[str], size: int):
         self.root, self.split, self.labels = root, split, labels
-        csv_path = root / "labels" / f"{split}_split.csv"
-        if not csv_path.is_file():
-            raise FileNotFoundError(f"Missing label CSV: {csv_path}")
+        label_dir = root / "labels"
+        # Different preprocessing notebooks export test_labels.csv rather than test_split.csv.
+        # Prefer the explicitly named labels file for test, while supporting either convention.
+        candidates = ([label_dir / "test_labels.csv", label_dir / "test_split.csv"]
+                      if split == "test" else
+                      [label_dir / f"{split}_split.csv", label_dir / f"{split}_labels.csv"])
+        csv_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if csv_path is None:
+            available = sorted(p.name for p in label_dir.glob("*.csv")) if label_dir.is_dir() else []
+            raise FileNotFoundError(
+                f"Missing {split} labels under {label_dir}. "
+                f"Looked for {[str(p) for p in candidates]}. "
+                f"Available CSVs: {available}"
+            )
+        print(f"[DATA] {root.name}/{split}: {csv_path}", flush=True)
         frame = pd.read_csv(csv_path)
         missing = [c for c in labels if c not in frame.columns]
         if missing:
@@ -85,7 +100,12 @@ class XrayCSV(Dataset):
             if len(others) != 1:
                 raise ValueError(f"{csv_path}: cannot unambiguously determine image ID column: {others}")
             id_candidates = others
-        self.ids = frame[id_candidates[0]].astype(str).tolist()
+        id_column = id_candidates[0]
+        if frame[id_column].isna().any():
+            raise ValueError(f"{csv_path}: missing image IDs in column {id_column}")
+        self.ids = frame[id_column].astype(str).tolist()
+        if len(self.ids) != len(set(self.ids)):
+            raise ValueError(f"{csv_path}: duplicate image IDs in {id_column}; verify split")
         values = frame[labels].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
         if not np.isfinite(values).all() or not np.isin(values, [0, 1]).all():
             raise ValueError(f"{csv_path}: labels must be nonmissing binary 0/1")
@@ -98,6 +118,9 @@ class XrayCSV(Dataset):
         for image_id in self.ids:
             image_id_path = Path(image_id)
             candidates = [image_dir / image_id, root / image_id]
+            # Allow CSV ID containing a relative or absolute path; do not silently substitute images.
+            if image_id_path.is_absolute():
+                candidates.insert(0, image_id_path)
             if not image_id_path.suffix:
                 candidates += [image_dir / f"{image_id}{ext}" for ext in IMAGE_EXTENSIONS]
             located = next((p for p in candidates if p.is_file()), None)
@@ -136,6 +159,7 @@ def canonical_model_name(path: Path, seed_dir: Path):
     name = path.stem.lower()
     name = re.sub(r"(^|[_-])(best|checkpoint|ckpt|model|weights|state_dict|latest|last)(?=[_-]|$)", "_", name)
     name = re.sub(r"[_-]+", "_", name).strip("_")
+    name = re.sub(r"_seed_?\d+$", "", name)
     return name or "unknown_model"
 
 
@@ -237,7 +261,10 @@ def predict(model, loader, device, label):
         ps.append(torch.sigmoid(logits.float()).cpu().numpy())
     if not ys:
         raise ValueError("Empty dataset")
-    return np.concatenate(ys), np.concatenate(ps)
+    truths, probs = np.concatenate(ys), np.concatenate(ps)
+    if not np.isfinite(probs).all():
+        raise ValueError("Model output contains NaN or infinite probabilities")
+    return truths, probs
 
 
 def validation_thresholds(y, p):
@@ -288,123 +315,215 @@ def get_saved_thresholds(payload, checkpoint_path, labels):
 
 
 def evaluate_metrics(y, p, thresholds, labels):
+    """Return aggregate metrics and complete per-label binary classification table.
+
+    Undefined AP/AUROC/F1 for single-class label is reported NaN, never fabricated.
+    Macro metrics use available labels and expose the number of valid classes.
+    """
+    y = np.asarray(y, dtype=np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    assert y.shape == p.shape and y.shape[1] == len(labels)
+    predicted = (p >= thresholds[None, :]).astype(np.int64)
     records = []
     for c, label in enumerate(labels):
-        yi, pi = y[:, c].astype(int), p[:, c]
+        yi, pi, pr = y[:, c], p[:, c], predicted[:, c]
         n_pos = int(yi.sum())
+        n_neg = len(yi) - n_pos
+        tp = int(((yi == 1) & (pr == 1)).sum())
+        fp = int(((yi == 0) & (pr == 1)).sum())
+        tn = int(((yi == 0) & (pr == 0)).sum())
+        fn = int(((yi == 1) & (pr == 0)).sum())
         valid = 0 < n_pos < len(yi)
-        ap = float(average_precision_score(yi, pi)) if valid else float("nan")
-        auc = float(roc_auc_score(yi, pi)) if valid else float("nan")
-        pred = (pi >= thresholds[c]).astype(int)
-        f1 = float(f1_score(yi, pred, zero_division=0)) if valid else float("nan")
-        recall = float(np.sum((yi == 1) & (pred == 1)) / n_pos) if n_pos else float("nan")
-        records.append({"class": label, "test_positives": n_pos, "test_negatives": int(len(yi) - n_pos),
-                        "AP": ap, "ROC_AUC": auc, "F1": f1, "Recall": recall,
-                        "threshold": float(thresholds[c])})
+        records.append(dict(
+            label=label, positives=n_pos, negatives=n_neg,
+            TP=tp, FP=fp, TN=tn, FN=fn,
+            AP=float(average_precision_score(yi, pi)) if valid else np.nan,
+            AUROC=float(roc_auc_score(yi, pi)) if valid else np.nan,
+            Precision=tp/(tp+fp) if (tp+fp) else np.nan,
+            Recall=tp/n_pos if n_pos else np.nan,
+            Specificity=tn/n_neg if n_neg else np.nan,
+            F1=2*tp/(2*tp+fp+fn) if (2*tp+fp+fn) else np.nan,
+            Balanced_Accuracy=(tp/n_pos + tn/n_neg)/2 if valid else np.nan,
+            threshold=float(thresholds[c]),
+        ))
     df = pd.DataFrame(records)
-    summary = {"mAP": float(df["AP"].mean()), "macro_AUC": float(df["ROC_AUC"].mean()),
-               "macro_F1": float(df["F1"].mean()), "macro_Recall": float(df["Recall"].mean()),
-               "valid_AP_classes": int(df["AP"].count()), "test_images": int(len(y))}
+    # Micro-F1 is computed globally across all labels; unlike macro averaging,
+    # this remains meaningful when an individual label has no positive examples.
+    summary = dict(
+        test_images=len(y),
+        mAP=float(df.AP.mean()),
+        macro_AUROC=float(df.AUROC.mean()),
+        macro_F1=float(df.F1.mean()),
+        micro_F1=float(f1_score(y.ravel(), predicted.ravel(), zero_division=0)),
+        macro_Precision=float(df.Precision.mean()),
+        macro_Recall=float(df.Recall.mean()),
+        macro_Balanced_Accuracy=float(df.Balanced_Accuracy.mean()),
+        valid_AP_labels=int(df.AP.notna().sum()),
+        valid_AUROC_labels=int(df.AUROC.notna().sum()),
+    )
     return summary, df
 
 
-def finite_json(value):
-    if isinstance(value, np.generic):
-        return finite_json(value.item())
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, dict):
-        return {k: finite_json(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [finite_json(v) for v in value]
-    return value
+def atomic_csv(df: pd.DataFrame, dest: Path):
+    """Write CSV atomically to avoid half-written results after interruption."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp = dest.with_suffix(dest.suffix + '.tmp')
+    df.to_csv(temp, index=False, encoding='utf-8-sig')
+    temp.replace(dest)
 
 
-def save_json(path, obj):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(finite_json(obj), ensure_ascii=False, indent=2), encoding="utf-8")
+def metric_summary(frame, group_cols, metrics):
+    if frame.empty:
+        return pd.DataFrame()
+    out = frame.groupby(group_cols, dropna=False).agg(
+        **{f'{m}_{stat}': (m, stat) for m in metrics for stat in ('mean', 'std')},
+        num_seeds=('seed', 'nunique'),
+    ).reset_index()
+    return out.sort_values(group_cols)
+
+
+def make_plots(class_df, main_df, out_dir, labels_by_dataset, prefix=''):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not main_df.empty:
+        for dataset, df in main_df.groupby('dataset'):
+            fig, ax = plt.subplots(figsize=(12, 5))
+            means = df.groupby('model')['mAP'].agg(['mean', 'std']).sort_values('mean', ascending=False)
+            ax.bar(np.arange(len(means)), means['mean'].values, yerr=means['std'].fillna(0).values, capsize=3)
+            ax.set_xticks(np.arange(len(means)), means.index, rotation=50, ha='right')
+            ax.set_ylabel('Test mAP')
+            ax.set_title(f'{dataset} — Stage 1 Test mAP (mean ± SD across seeds)')
+            fig.tight_layout()
+            fig.savefig(out_dir / f'{prefix}{dataset}_stage1_test_mAP.png', dpi=180)
+            plt.close(fig)
+    if not class_df.empty:
+        for dataset, df in class_df.groupby('dataset'):
+            pivot = df.pivot_table(index='label', columns='model', values='AP', aggfunc='mean')
+            pivot = pivot.reindex(labels_by_dataset[dataset])
+            fig, ax = plt.subplots(figsize=(max(10, len(pivot.columns)*0.75), 7))
+            im = ax.imshow(pivot.to_numpy(dtype=float), aspect='auto', vmin=0, vmax=1)
+            ax.set_yticks(range(len(pivot)), pivot.index)
+            ax.set_xticks(range(len(pivot.columns)), pivot.columns, rotation=55, ha='right')
+            ax.set_title(f'{dataset} — Per-label Test AP, mean across seeds')
+            fig.colorbar(im, ax=ax, label='AP')
+            fig.tight_layout()
+            fig.savefig(out_dir / f'{prefix}{dataset}_stage1_per_class_AP_heatmap.png', dpi=180)
+            plt.close(fig)
 
 
 def main():
     args = parse_args()
     labels_by_dataset = load_labels(args)
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda requested, but CUDA unavailable")
-    device = torch.device("cuda" if (args.device == "auto" and torch.cuda.is_available()) or args.device == "cuda" else "cpu")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Device: {device} | Image size: {args.image_size} | Checkpoints: {args.checkpoints_root}")
-    all_rows, errors = [], []
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA requested but not available')
+    device = torch.device('cuda' if (args.device == 'cuda' or (args.device == 'auto' and torch.cuda.is_available())) else 'cpu')
+    if not re.fullmatch(r"[a-zA-Z0-9_-]*", args.output_prefix):
+        raise ValueError("--output-prefix may only contain letters, numbers, _ or -")
+    csv_dir = args.output_dir / 'csv'
+    figure_dir = args.output_dir / 'visualizations' 
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    print(f'[CONFIG] flow={args.flow}, device={device}, checkpoints={args.checkpoints_root}, output={csv_dir}')
+    all_rows, class_rows, threshold_rows, errors = [], [], [], []
+    plan = []
+    coverage = []
     for dataset in args.datasets:
+        for seed in args.seeds:
+            checkpoints = find_checkpoints(args.checkpoints_root, dataset, seed, args.checkpoint_pattern)
+            coverage.append(dict(dataset=dataset, seed=seed, discovered_models=len(checkpoints),
+                                 expected_models=args.expected_models, complete=len(checkpoints)==args.expected_models))
+            for name, file in checkpoints:
+                plan.append((dataset, seed, name, file))
+    cov_df = pd.DataFrame(coverage)
+    if args.strict_coverage and not cov_df.complete.all():
+        raise RuntimeError('Incomplete checkpoint coverage:\n' + cov_df.to_string(index=False))
+    if not plan:
+        raise SystemExit('No checkpoint found. Check --checkpoints-root and --checkpoint-pattern')
+    print(f'[PLAN] {len(plan)} unique checkpoint evaluations')
+    if args.strict_coverage and args.checkpoint_pattern != '*' and args.expected_models == 14:
+        print('[HINT] Strict coverage expects 14 configurations; for a filtered checkpoint ' 
+              'pass --expected-models 1 (or appropriate subset count).')
+    # Cache dataset loaders for a single dataset, not all images/predictions.
+    for dataset in args.datasets:
+        runs = [item for item in plan if item[0] == dataset]
+        if not runs:
+            continue
         labels = labels_by_dataset[dataset]
         data_dir = args.data_root / dataset
-        runs = [(seed, model_name, path)
-                for seed in args.seeds
-                for model_name, path in find_checkpoints(args.checkpoints_root, dataset, seed, args.checkpoint_pattern)]
-        if not runs:
-            msg = f"No eligible checkpoint in {args.checkpoints_root / dataset} for requested seeds"
-            if args.strict_coverage:
-                raise FileNotFoundError(msg)
-            print(f"WARNING: {msg}")
+        options = dict(batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
+                       pin_memory=device.type=='cuda')
+        try:
+            val_loader = DataLoader(XrayCSV(data_dir, 'val', labels, args.image_size), **options)
+            test_loader = DataLoader(XrayCSV(data_dir, 'test', labels, args.image_size), **options)
+        except Exception as exc:
+            if args.fail_fast:
+                raise
+            errors += [dict(dataset=dataset, seed=seed, model=name, checkpoint=str(path), error=f'dataset: {exc}')
+                       for _, seed, name, path in runs]
             continue
-        print(f"\n{dataset}: found {len(runs)} checkpoint(s)")
-        validation_set = XrayCSV(data_dir, "val", labels, args.image_size)
-        test_set = XrayCSV(data_dir, "test", labels, args.image_size)
-        loader_options = dict(batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
-                              pin_memory=device.type == "cuda")
-        val_loader = DataLoader(validation_set, **loader_options)
-        test_loader = DataLoader(test_set, **loader_options)
-        for seed, model_name, path in runs:
-            print(f"  [{dataset} | seed {seed} | {model_name}] {path}")
+        for _, seed, name, path in runs:
+            print(f'[RUN] {dataset} | seed{seed} | {name} | {path.name}', flush=True)
+            model = None
             try:
                 model, payload = build_model(path, device)
-                thresholds, threshold_source = get_saved_thresholds(payload, path, labels)
+                thresholds, source = get_saved_thresholds(payload, path, labels)
                 if thresholds is None:
-                    y_val, p_val = predict(model, val_loader, device, "validation")
+                    y_val, p_val = predict(model, val_loader, device, 'validation')
                     thresholds = validation_thresholds(y_val, p_val)
-                    threshold_source = "computed_from_validation"
-                y_test, p_test = predict(model, test_loader, device, "test")
-                summary, class_table = evaluate_metrics(y_test, p_test, thresholds, labels)
-                dest = args.output_dir / dataset / model_name / f"seed{seed}"
-                dest.mkdir(parents=True, exist_ok=True)
-                class_table.to_csv(dest / "per_class_metrics.csv", index=False, encoding="utf-8-sig")
-                save_json(dest / "thresholds_used.json", dict(zip(labels, thresholds.tolist())))
-                np.savez_compressed(dest / "test_predictions.npz", y_true=y_test, y_prob=p_test,
-                                    labels=np.asarray(labels, dtype=str))
-                row = {"dataset": dataset, "model": model_name, "seed": seed, "checkpoint": str(path),
-                       "threshold_source": threshold_source, **summary}
-                save_json(dest / "test_metrics.json", row)
-                all_rows.append(row)
-                print(f"    mAP={summary['mAP']:.4f}, AUC={summary['macro_AUC']:.4f}, F1={summary['macro_F1']:.4f}")
-                del model
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                    source = 'computed_from_validation'
+                y_test, p_test = predict(model, test_loader, device, 'test')
+                summary, detail = evaluate_metrics(y_test, p_test, thresholds, labels)
+                common = dict(dataset=dataset, model=name, seed=seed, checkpoint=str(path), threshold_source=source)
+                all_rows.append({**common, **summary})
+                if args.flow in ('detail', 'both'):
+                    detail.insert(0, 'seed', seed)
+                    detail.insert(0, 'model', name)
+                    detail.insert(0, 'dataset', dataset)
+                    class_rows.append(detail)
+                    threshold_rows.extend(dict(dataset=dataset, model=name, seed=seed, label=l,
+                                               threshold=float(t), source=source)
+                                          for l, t in zip(labels, thresholds))
+                print(f'      mAP={summary["mAP"]:.4f}, macro_F1={summary["macro_F1"]:.4f}', flush=True)
             except Exception as exc:
-                errors.append({"dataset": dataset, "seed": seed, "model": model_name,
-                               "checkpoint": str(path), "error": str(exc)})
-                print(f"    ERROR: {exc}", file=sys.stderr)
+                errors.append(dict(dataset=dataset, model=name, seed=seed, checkpoint=str(path), error=str(exc)))
+                print(f'[ERROR] {dataset}/{name}/seed{seed}: {exc}', file=sys.stderr, flush=True)
                 if args.fail_fast:
                     raise
+            finally:
+                del model
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+    metrics = ['mAP', 'macro_AUROC', 'macro_F1', 'micro_F1', 'macro_Precision', 'macro_Recall', 'macro_Balanced_Accuracy']
     if all_rows:
-        runs_df = pd.DataFrame(all_rows).sort_values(["dataset", "model", "seed"])
-        runs_df.to_csv(args.output_dir / "all_runs.csv", index=False, encoding="utf-8-sig")
-        metric_cols = ["mAP", "macro_AUC", "macro_F1", "macro_Recall"]
-        grouped = runs_df.groupby(["dataset", "model"], dropna=False)[metric_cols].agg(["mean", "std"])
-        grouped.columns = [f"{metric}_{stat}" for metric, stat in grouped.columns]
-        grouped = grouped.reset_index()
-        grouped["num_seeds"] = runs_df.groupby(["dataset", "model"]).size().values
-        grouped.sort_values(["dataset", "mAP_mean"], ascending=[True, False]).to_csv(
-            args.output_dir / "summary_mean_std.csv", index=False, encoding="utf-8-sig")
-        print(f"\nSaved {len(all_rows)} successful evaluations to {args.output_dir}")
-        print(grouped[["dataset", "model", "num_seeds", "mAP_mean", "mAP_std", "macro_F1_mean"]].to_string(index=False))
+        main_df = pd.DataFrame(all_rows).sort_values(['dataset', 'model', 'seed'])
+        # Main flow: one row per checkpoint plus mean ± SD per model/dataset.
+        if args.flow in ('main', 'both'):
+            atomic_csv(main_df, csv_dir / f'{args.output_prefix}all_runs.csv')
+            summary_df = metric_summary(main_df, ['dataset', 'model'], metrics)
+            atomic_csv(summary_df, csv_dir / f'{args.output_prefix}summary_mean_std.csv')
+            print(f'[MAIN] saved prefixed all_runs.csv and summary_mean_std.csv ({len(main_df)} runs)')
+        else:
+            summary_df = pd.DataFrame()
+        if args.flow in ('detail', 'both'):
+            if class_rows:
+                detail_df = pd.concat(class_rows, ignore_index=True)
+                atomic_csv(detail_df, csv_dir / f'{args.output_prefix}per_class.csv')
+                atomic_csv(pd.DataFrame(threshold_rows), csv_dir / f'{args.output_prefix}thresholds_validation.csv')
+                by_class = detail_df.groupby(['dataset','model','label'], as_index=False).agg(
+                    AP_mean=('AP','mean'), AP_std=('AP','std'),
+                    AUROC_mean=('AUROC','mean'), F1_mean=('F1','mean'),
+                    Recall_mean=('Recall','mean'), num_seeds=('seed','nunique'))
+                atomic_csv(by_class, csv_dir / f'{args.output_prefix}per_class_mean_std.csv')
+                print(f'[DETAIL] saved prefixed per_class.csv, per_class_mean_std.csv, thresholds_validation.csv')
+                make_plots(detail_df, main_df, figure_dir, labels_by_dataset, args.output_prefix)
+                print(f'[DETAIL] PNG saved to {figure_dir}')
+            else:
+                print('[DETAIL] No successful per-class evaluations')
     if errors:
-        save_json(args.output_dir / "errors.json", errors)
-        print(f"\n{len(errors)} run(s) failed. See {args.output_dir / 'errors.json'}", file=sys.stderr)
-    if not all_rows:
-        raise SystemExit("No checkpoints were successfully evaluated. Confirm architecture, data paths, CSV schema and checkpoint names.")
-    if errors or (args.strict_coverage and any(not find_checkpoints(args.checkpoints_root, d, s, args.checkpoint_pattern)
-                                                for d in args.datasets for s in args.seeds)):
+        atomic_csv(pd.DataFrame(errors), csv_dir / f'{args.output_prefix}errors.csv')
+        print(f'[WARN] {len(errors)} failed run(s); see {args.output_prefix}errors.csv')
+    if not all_rows or errors:
         raise SystemExit(1)
+    print(f'[DONE] evaluated {len(all_rows)} checkpoints')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
