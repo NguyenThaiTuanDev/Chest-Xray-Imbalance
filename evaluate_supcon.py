@@ -164,7 +164,9 @@ def build_model(path, device, trusted=False, dataset=None, seed=None, expected_s
         raise ValueError(f'{path}: trained image_size={cfg.get("image_size")}, evaluation={expected_size}')
     model_loss=str(cfg.get('loss','')).lower()
     expected_tag=canonical_model_name(path,path.parent)
-    actual_tag=str(cfg.get('loss_tag','')).lower()
+    # train_supcon.py defaults --loss-tag to None; it is NOT the literal tag 'none'.
+    raw_tag = cfg.get('loss_tag')
+    actual_tag = str(raw_tag).strip().lower() if raw_tag is not None else ''
     if model_loss and not expected_tag.startswith(model_loss+'_') and not (
             model_loss=='bce' and expected_tag=='bce_supcon'):
         raise ValueError(f'{path}: loss name mismatch checkpoint config: {model_loss} vs {expected_tag}')
