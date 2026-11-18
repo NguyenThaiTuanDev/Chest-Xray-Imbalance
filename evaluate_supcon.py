@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import sys
 from pathlib import Path
@@ -10,10 +9,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from PIL import Image
-from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, roc_auc_score, precision_score, recall_score, balanced_accuracy_score, confusion_matrix
-from torch.utils.data import DataLoader, Dataset
-from torchvision import models, transforms
+from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve, roc_auc_score
+from torch.utils.data import DataLoader
+from torchvision import models
 from tqdm.auto import tqdm
 import matplotlib
 matplotlib.use("Agg")
@@ -41,17 +39,17 @@ AVOID_TOKENS = ("latest", "last", "final_epoch", "optimizer", "scheduler")
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p = argparse.ArgumentParser(description="Stage-2 SupCon test evaluator", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--data-root", type=Path, default=Path("data/processed"))
     p.add_argument("--checkpoints-root", type=Path, default=Path("outputs/stage2/checkpoints"))
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/stage2"), help="Stage-1 output root containing csv/ and visualizations/")
+    p.add_argument("--output-dir", type=Path, default=Path("outputs/stage2"), help="Stage-2 output root containing csv/ and visualizations/")
     p.add_argument("--flow", choices=["main", "detail", "both"], default="both", help="main: major metrics; detail: per-label metrics + figures; both: one inference pass")
-    p.add_argument("--output-prefix", default="supcon_", help="Prefix for generated CSV/PNG names; default avoids overwriting prior Stage-1 reports")
+    p.add_argument("--output-prefix", default="supcon_", help="Prefix for generated CSV/PNG names; default avoids overwriting prior Stage-2 reports")
     p.add_argument("--expected-models", type=int, default=1, help="Expected SupCon configurations per dataset/seed in the selected checkpoint subset")
     p.add_argument("--datasets", nargs="+", default=["VinDr-CXR", "VinDr-PCXR"], choices=list(DEFAULT_LABELS))
     p.add_argument("--seeds", nargs="+", type=int, default=[7, 42, 132, 2024, 3407])
     p.add_argument("--labels-json", type=Path, help="JSON map: dataset name -> ordered list of 14 class names")
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
@@ -162,16 +160,22 @@ def build_model(path, device, trusted=False, dataset=None, seed=None, expected_s
         raise ValueError(f'{path}: checkpoint dataset/seed mismatch: {cfg.get("dataset")}/{cfg.get("seed")}')
     if expected_size is not None and int(cfg.get('image_size',-1)) != int(expected_size):
         raise ValueError(f'{path}: trained image_size={cfg.get("image_size")}, evaluation={expected_size}')
-    model_loss=str(cfg.get('loss','')).lower()
-    expected_tag=canonical_model_name(path,path.parent)
-    # train_supcon.py defaults --loss-tag to None; it is NOT the literal tag 'none'.
+    # A missing/None/blank loss_tag is intentional in train_supcon.py.
+    # Check against the actual training loss family and filename, not str(None).
+    model_loss = str(cfg.get('loss') or '').strip().lower()
+    expected_tag = canonical_model_name(path, path.parent)
+    filename_loss = expected_tag.removesuffix('_supcon')
     raw_tag = cfg.get('loss_tag')
-    actual_tag = str(raw_tag).strip().lower() if raw_tag is not None else ''
-    if model_loss and not expected_tag.startswith(model_loss+'_') and not (
-            model_loss=='bce' and expected_tag=='bce_supcon'):
-        raise ValueError(f'{path}: loss name mismatch checkpoint config: {model_loss} vs {expected_tag}')
-    if actual_tag and actual_tag not in expected_tag:
-        raise ValueError(f'{path}: loss_tag={actual_tag} not reflected in filename={expected_tag}')
+    configured_tag = str(raw_tag).strip().lower() if raw_tag is not None else ''
+    if configured_tag in ('none', 'null'):
+        configured_tag = ''
+    if model_loss not in ('bce', 'wbce', 'focal', 'asl'):
+        raise ValueError(f'{path}: unexpected classification loss {model_loss!r}')
+    if filename_loss != model_loss and not filename_loss.startswith(model_loss + '_'):
+        raise ValueError(f'{path}: loss={model_loss!r} differs from checkpoint filename {filename_loss!r}')
+    if configured_tag and configured_tag != filename_loss:
+        raise ValueError(f'{path}: configured loss_tag={configured_tag!r} differs from filename={filename_loss!r}')
+    print(f'[CHECKPOINT] loss={model_loss}, loss_tag={configured_tag or "<default>"}, model={expected_tag}', flush=True)
     state=payload['model_state']
     if not state or not all(torch.is_tensor(v) for v in state.values()):
         raise ValueError('Invalid Stage-2 model_state')
@@ -355,7 +359,6 @@ def make_plots(class_df, main_df, out_dir, labels_by_dataset, prefix=''):
             fig.savefig(out_dir / f'{prefix}{dataset}_stage2_per_class_AP_heatmap.png', dpi=180)
             plt.close(fig)
 
-
 def main():
     args = parse_args()
     labels_by_dataset = load_labels(args)
@@ -394,8 +397,6 @@ def main():
             continue
         labels = labels_by_dataset[dataset]
         data_dir = args.data_root / dataset
-        options = dict(batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
-                       pin_memory=device.type=='cuda')
         try:
             val_loader = make_loader(args.data_root,dataset,'val',args.image_size,args.batch_size,args.num_workers,device,labels)
             test_loader = make_loader(args.data_root,dataset,'test',args.image_size,args.batch_size,args.num_workers,device,labels)
