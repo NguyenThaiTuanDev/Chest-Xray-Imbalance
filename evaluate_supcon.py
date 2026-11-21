@@ -17,6 +17,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if (PROJECT_ROOT / 'src').is_dir() and str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATASET_PATHS = {name: (SCRIPT_DIR / '..' / 'data' / 'processed' / name).resolve()
+                 for name in ('VinDr-CXR', 'VinDr-PCXR')}
+DEFAULT_OUTPUT_ROOT = (SCRIPT_DIR / '..' / 'outputs' / 'stage2').resolve()
+PRESET_NAMES = ('bce', 'wbce_w0', 'wbce_w1', 'wbce_w2', 'wbce_w3',
+                'focal_f0', 'focal_f1', 'focal_f2', 'focal_f3', 'focal_f4',
+                'asl_a0', 'asl_a1', 'asl_a2', 'asl_a3')
+
 DEFAULT_LABELS = {
     "VinDr-CXR": [
         "Aortic enlargement", "Atelectasis", "Calcification", "Cardiomegaly",
@@ -40,20 +52,21 @@ AVOID_TOKENS = ("latest", "last", "final_epoch", "optimizer", "scheduler")
 
 def parse_args():
     p = argparse.ArgumentParser(description="Stage-2 SupCon test evaluator", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--data-root", type=Path, default=Path("data/processed"))
-    p.add_argument("--checkpoints-root", type=Path, default=Path("outputs/stage2/checkpoints"))
-    p.add_argument("--output-dir", type=Path, default=Path("outputs/stage2"), help="Stage-2 output root containing csv/ and visualizations/")
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument("--checkpoints-root", type=Path, default=DEFAULT_OUTPUT_ROOT / "checkpoints")
+    p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Stage-2 output root containing csv/ and visualizations/")
     p.add_argument("--flow", choices=["main", "detail", "both"], default="both", help="main: major metrics; detail: per-label metrics + figures; both: one inference pass")
     p.add_argument("--output-prefix", default="supcon_", help="Prefix for generated CSV/PNG names; default avoids overwriting prior Stage-2 reports")
-    p.add_argument("--expected-models", type=int, default=1, help="Expected SupCon configurations per dataset/seed in the selected checkpoint subset")
-    p.add_argument("--datasets", nargs="+", default=["VinDr-CXR", "VinDr-PCXR"], choices=list(DEFAULT_LABELS))
-    p.add_argument("--seeds", nargs="+", type=int, default=[7, 42, 132, 2024, 3407])
+    p.add_argument("--expected-models", type=int, default=14, help="Expected SupCon configurations per dataset/seed in the selected checkpoint subset")
+    p.add_argument("--datasets", nargs="+", default=["VinDr-PCXR"], choices=list(DEFAULT_LABELS))
+    p.add_argument("--seeds", nargs="+", type=int, default=[7])
     p.add_argument("--labels-json", type=Path, help="JSON map: dataset name -> ordered list of 14 class names")
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"])
     p.add_argument("--checkpoint-pattern", default="best_*_supcon_seed*.pth", help="Filter checkpoint filename using shell glob (e.g. '*best*.pth')")
+    p.add_argument("--allow-incomplete", action="store_true", help="Evaluate unfinished BEST without completion summary (not recommended)")
     p.add_argument("--strict-coverage", action="store_true", help="Stop on incomplete dataset/seed coverage")
     p.add_argument("--fail-fast", action="store_true", help="Stop on first evaluation failure")
     p.add_argument("--trusted-checkpoints", action="store_true",
@@ -76,7 +89,7 @@ def make_loader(data_root, dataset, split, image_size, batch_size, num_workers, 
     """Use the exact training data decoding and Albumentations normalization."""
     from src.data.dataset import VinDrDataset, CLASSES
     from src.data.transforms import get_transforms
-    root = data_root / dataset
+    root = ((data_root / dataset) if data_root is not None else DATASET_PATHS[dataset]).resolve()
     labels_dir = root / 'labels'
     candidates = ([labels_dir/'test_labels.csv', labels_dir/'test_split.csv']
                   if split == 'test' else
@@ -89,7 +102,7 @@ def make_loader(data_root, dataset, split, image_size, batch_size, num_workers, 
         raise RuntimeError(f'{dataset}: source CLASSES differs from the evaluation label order')
     print(f'[DATA] {dataset}/{split}: {csv_file}',flush=True)
     ds = VinDrDataset(csv_file=csv_file, img_dir=root/('test' if split == 'test' else 'train'),
-                      dataset_name=dataset, transform=get_transforms(split,image_size), strict_images=True)
+                      dataset_name=dataset, transform=get_transforms('val',image_size), strict_images=True)
     return DataLoader(ds,batch_size=batch_size,shuffle=False,num_workers=num_workers,
                       pin_memory=device.type=='cuda')
 
@@ -143,8 +156,8 @@ def load_checkpoint(path: Path, trusted: bool = False):
         payload=torch.load(path,map_location='cpu',weights_only=False)
     if not isinstance(payload,dict) or not isinstance(payload.get('model_state'),dict):
         raise ValueError(f'{path}: expected Stage-2 checkpoint with model_state dict')
-    if not isinstance(payload.get('config'),dict):
-        raise ValueError(f'{path}: missing config metadata')
+    if not isinstance(payload.get('config',payload.get('signature')),dict):
+        raise ValueError(f'{path}: missing config/signature metadata')
     return payload
 
 
@@ -155,27 +168,27 @@ def build_model(path, device, trusted=False, dataset=None, seed=None, expected_s
     Loading is strict to avoid silently evaluating a partially initialized model.
     """
     payload=load_checkpoint(path,trusted)
-    cfg=payload['config']
+    cfg=payload.get('config', payload.get('signature'))
     if cfg.get('dataset') != dataset or int(cfg.get('seed',-1)) != int(seed):
         raise ValueError(f'{path}: checkpoint dataset/seed mismatch: {cfg.get("dataset")}/{cfg.get("seed")}')
     if expected_size is not None and int(cfg.get('image_size',-1)) != int(expected_size):
         raise ValueError(f'{path}: trained image_size={cfg.get("image_size")}, evaluation={expected_size}')
-    # A missing/None/blank loss_tag is intentional in train_supcon.py.
-    # Check against the actual training loss family and filename, not str(None).
-    model_loss = str(cfg.get('loss') or '').strip().lower()
     expected_tag = canonical_model_name(path, path.parent)
     filename_loss = expected_tag.removesuffix('_supcon')
-    raw_tag = cfg.get('loss_tag')
-    configured_tag = str(raw_tag).strip().lower() if raw_tag is not None else ''
-    if configured_tag in ('none', 'null'):
-        configured_tag = ''
-    if model_loss not in ('bce', 'wbce', 'focal', 'asl'):
-        raise ValueError(f'{path}: unexpected classification loss {model_loss!r}')
-    if filename_loss != model_loss and not filename_loss.startswith(model_loss + '_'):
-        raise ValueError(f'{path}: loss={model_loss!r} differs from checkpoint filename {filename_loss!r}')
-    if configured_tag and configured_tag != filename_loss:
-        raise ValueError(f'{path}: configured loss_tag={configured_tag!r} differs from filename={filename_loss!r}')
-    print(f'[CHECKPOINT] loss={model_loss}, loss_tag={configured_tag or "<default>"}, model={expected_tag}', flush=True)
+    if filename_loss not in PRESET_NAMES:
+        raise ValueError(f'{path}: unexpected loss preset {filename_loss!r}')
+    if cfg.get('preset') is not None and cfg['preset'] != filename_loss:
+        raise ValueError(f'{path}: signature preset mismatch: {cfg["preset"]}')
+    family = str((cfg.get('loss_parameters') or {}).get('loss', cfg.get('loss',''))).lower()
+    if family not in ('bce','wbce','focal','asl'):
+        raise ValueError(f'{path}: invalid loss family {family!r}')
+    if filename_loss != family and not filename_loss.startswith(family + '_'):
+        raise ValueError(f'{path}: loss family does not match filename')
+    raw_tag = payload.get('loss_tag',cfg.get('loss_tag'))
+    configured_tag = str(raw_tag).lower() if raw_tag is not None else ''
+    if configured_tag not in ('','none','null',filename_loss):
+        raise ValueError(f'{path}: loss_tag mismatch')
+    print(f'[CHECKPOINT] loss={family}, loss_tag={configured_tag or "<default>"}, model={expected_tag}', flush=True)
     state=payload['model_state']
     if not state or not all(torch.is_tensor(v) for v in state.values()):
         raise ValueError('Invalid Stage-2 model_state')
@@ -190,7 +203,8 @@ def build_model(path, device, trusted=False, dataset=None, seed=None, expected_s
         while key.startswith('module.'):
             key=key[len('module.'):]
         if key.startswith('encoder_q.'):
-            native='features.'+key[len('encoder_q.'):]
+            suffix=key[len('encoder_q.'): ]
+            native=suffix if suffix.startswith('features.') else 'features.'+suffix
         elif key.startswith('classifier.'):
             native=key
         else:
@@ -362,6 +376,8 @@ def make_plots(class_df, main_df, out_dir, labels_by_dataset, prefix=''):
 def main():
     args = parse_args()
     labels_by_dataset = load_labels(args)
+    if args.batch_size < 1 or args.num_workers < 0 or args.expected_models < 1:
+        raise ValueError('Invalid batch size, num_workers or expected_models')
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but not available')
     device = torch.device('cuda' if (args.device == 'cuda' or (args.device == 'auto' and torch.cuda.is_available())) else 'cpu')
@@ -396,7 +412,7 @@ def main():
         if not runs:
             continue
         labels = labels_by_dataset[dataset]
-        data_dir = args.data_root / dataset
+        data_dir = (args.data_root / dataset) if args.data_root else DATASET_PATHS[dataset]
         try:
             val_loader = make_loader(args.data_root,dataset,'val',args.image_size,args.batch_size,args.num_workers,device,labels)
             test_loader = make_loader(args.data_root,dataset,'test',args.image_size,args.batch_size,args.num_workers,device,labels)
@@ -410,7 +426,19 @@ def main():
             print(f'[RUN] {dataset} | seed{seed} | {name} | {path.name}', flush=True)
             model = None
             try:
+                summary_path = (args.output_dir / 'csv' /
+                                f'{dataset}_{name.removesuffix("_supcon")}_seed{seed}_summary.json')
+                if not args.allow_incomplete:
+                    if not summary_path.is_file():
+                        raise FileNotFoundError(f'No completion summary for BEST: {summary_path}')
+                    completed = json.loads(summary_path.read_text(encoding='utf-8'))
+                    if (not completed.get('complete') or completed.get('dataset') != dataset
+                            or completed.get('seed') != seed
+                            or completed.get('loss_tag') != name.removesuffix('_supcon')):
+                        raise ValueError(f'Completion summary mismatch: {summary_path}')
                 model, payload = build_model(path, device, args.trusted_checkpoints, dataset, seed, args.image_size)
+                if not args.allow_incomplete and completed.get('signature') != payload.get('config', payload.get('signature')):
+                    raise ValueError(f'Completion configuration differs from checkpoint: {summary_path}')
                 thresholds, source = get_saved_thresholds(payload, path, labels)
                 if thresholds is None:
                     y_val, p_val = predict(model, val_loader, device, 'validation')

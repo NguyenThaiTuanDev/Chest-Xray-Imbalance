@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gc
 import json
 import os
 import random
 import shutil
-import subprocess
 import sys
 import time
-import traceback
 from pathlib import Path
 
 SEEDS = (7, 42, 132, 2024, 3407)
 DATASETS = ("VinDr-CXR", "VinDr-PCXR")
+# Resolve relative to this file, not the terminal's current working directory.
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATASET_PATHS = {
+    "VinDr-CXR": (SCRIPT_DIR / "data" / "processed" / "VinDr-CXR").resolve(),
+    "VinDr-PCXR": (SCRIPT_DIR / "data" / "processed" / "VinDr-PCXR").resolve(),
+}
+DEFAULT_OUTPUT_ROOT = (SCRIPT_DIR / "outputs" / "stage2").resolve()
+
 
 PRESETS = {
     "bce":       dict(loss="bce"),
@@ -129,7 +134,7 @@ def choose_device(requested):
         return torch.device("cpu")
     log(f"[GPU] {torch.cuda.get_device_name(0)} | GPUs detected={torch.cuda.device_count()}")
     if torch.cuda.device_count() > 1:
-        log("[NOTE] This local trainer uses CUDA:0 only; no DataParallel to protect the momentum queue.")
+        log("[NOTE] Using GPU 0 only. Multi-GPU DDP requires synchronization of the SupCon queue; no unsafe DataParallel.")
     return torch.device("cuda:0")
 
 
@@ -166,42 +171,47 @@ def run_single(args):
     set_seed(args.seed)
     device = choose_device(args.device)
     root = args.output_root.resolve()
-    data_dir = args.data_root.resolve() / args.dataset
+    data_dir = Path(args.data_dir).resolve() if args.data_dir else DATASET_PATHS[args.dataset]
     validate_data(data_dir)
     final = root / "checkpoints" / args.dataset / f"seed{args.seed}" / f"best_{args.preset}_supcon_seed{args.seed}.pth"
     work = root / "_work" / args.dataset / args.preset / f"seed{args.seed}"
     latest = work / "latest.pth"
-    best = work / "best.pth"
     history = work / "history.csv"
     config_path = work / "config.json"
-    report_path = root / "csv" / "training_history.csv"
+    report_path = root / "csv" / "training" / args.dataset / f"seed{args.seed}" / f"{args.preset}.csv"
+    summary_path = root / "csv" / f"{args.dataset}_{args.preset}_seed{args.seed}_summary.json"
     signature = config_signature(args)
-    if final.exists() and not args.overwrite:
-        log(f"[SKIP] Existing BEST, preserved: {final}")
-        return
-    if final.exists() and args.overwrite and not args.confirm_overwrite:
-        raise ValueError("Overwriting existing BEST requires BOTH --overwrite and --confirm-overwrite")
-    if args.resume and not latest.is_file():
-        raise FileNotFoundError(f"--resume requested but no local latest checkpoint: {latest}")
-    if latest.exists() and not args.resume:
-        raise FileExistsError(f"Partial run exists: {latest}; use --resume (recommended) or --discard-partial")
-    if work.exists() and not latest.exists() and not args.discard_partial and not args.resume:
-        leftovers = [x.name for x in work.iterdir() if x.name != "config.json"]
-        if leftovers:
-            raise FileExistsError(f"Incomplete work folder: {work}; files={leftovers}. Inspect before using --discard-partial")
-        # A config-only folder is safe to retry from epoch 1 after an early crash.
+    # BEST is considered complete only when its summary confirms the same config.
+    # No automatic deletion or silent overwrite of existing checkpoints.
+    if summary_path.is_file():
+        summ = json.loads(summary_path.read_text(encoding="utf-8"))
+        if not final.is_file() or not summ.get("complete") or summ.get("signature") != signature:
+            raise RuntimeError("Existing completion summary/BEST mismatch; inspect manually.")
+        log(f"[SKIP] Verified completed run: {args.dataset} {args.preset} seed{args.seed}")
+        return "skipped"
+    if final.is_file() and not args.resume:
+        raise RuntimeError(f"Unfinished run already has a BEST checkpoint: {final}. Use --resume.")
+    if final.is_file() and not (work / "latest.pth").is_file():
+        raise RuntimeError("BEST without completion summary or latest resume checkpoint. Inspect manually.")
     if args.discard_partial:
-        if args.resume:
-            raise ValueError("--resume and --discard-partial conflict")
-        if work.exists():
-            shutil.rmtree(work)
+        raise ValueError("Automatic discard is disabled. Archive/remove the specific _work folder manually after checking its contents.")
     work.mkdir(parents=True, exist_ok=True)
-    if config_path.exists():
+    if config_path.is_file():
         old = json.loads(config_path.read_text(encoding="utf-8"))
         if old != signature:
-            raise ValueError("Saved config differs from current command; refusing incompatible resume")
+            raise ValueError(f"Saved config differs; cannot resume: {config_path}")
     else:
+        other = [p.name for p in work.iterdir() if p.name != "config.json"]
+        if other:
+            raise RuntimeError(f"Unexpected work files without config: {other}")
         atomic_json_save(signature, config_path)
+    if latest.is_file() and not args.resume:
+        raise RuntimeError(f"A partial run exists at {latest}. Add --resume to continue.")
+    if args.resume and not latest.is_file():
+        log("[RESUME] No latest.pth yet: starting cleanly from epoch 1 (validated config-only state).")
+        extras = [p.name for p in work.iterdir() if p.name not in ("config.json",)]
+        if extras:
+            raise RuntimeError(f"Unexpected partial state without latest.pth: {extras}; inspect manually.")
 
     log(f"[DATA] Loading {data_dir}")
     train_ds = ContrastiveVinDrDataset(data_dir, args.dataset, args.image_size, strict_images=True)
@@ -231,7 +241,7 @@ def run_single(args):
         scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and not args.no_amp))
 
     start_epoch, best_map, best_epoch = 1, float("-inf"), 0
-    if args.resume:
+    if args.resume and latest.is_file():
         log(f"[RESUME] Loading {latest}")
         ck = torch.load(latest, map_location="cpu", weights_only=False)
         if ck["signature"] != signature:
@@ -256,13 +266,30 @@ def run_single(args):
         elif len(stored) != start_epoch - 1:
             raise RuntimeError("History and latest checkpoint disagree: manual recovery required")
         if best_epoch:
-            if not best.is_file():
-                raise FileNotFoundError(f"Best partial checkpoint missing: {best}")
-            best_meta = torch.load(best, map_location="cpu", weights_only=False)
-            if int(best_meta.get("epoch", -1)) != best_epoch:
-                raise RuntimeError("Best partial and latest checkpoint disagree (possible crash between saves). "
-                                   "Do not resume automatically; inspect the run to prevent incorrect BEST.")
-            del best_meta
+            # On an interruption after saving latest but before publishing BEST,
+            # latest contains the winning weights only when it was itself the best epoch.
+            if not final.is_file():
+                if best_epoch != ck["epoch"]:
+                    raise RuntimeError("BEST missing and latest is not the best epoch; refusing reconstruction")
+                atomic_torch_save(dict(model_state=ck["model_state"], epoch=ck["epoch"],
+                                       best_val_map=best_map, validation=ck["validation"],
+                                       config=signature, dataset=args.dataset, seed=args.seed,
+                                       loss_tag=args.preset), final)
+                log(f"[RECOVERY] Published BEST at epoch {best_epoch} from latest")
+            else:
+                best_meta = torch.load(final, map_location="cpu", weights_only=False)
+                saved_epoch = int(best_meta.get("epoch", -1))
+                if best_meta.get("config") != signature or saved_epoch > best_epoch:
+                    raise RuntimeError("Published BEST metadata is inconsistent; inspect manually")
+                if saved_epoch < best_epoch:
+                    if best_epoch != ck["epoch"]:
+                        raise RuntimeError("Published BEST is stale and cannot be recovered from latest")
+                    atomic_torch_save(dict(model_state=ck["model_state"], epoch=ck["epoch"],
+                                           best_val_map=best_map, validation=ck["validation"],
+                                           config=signature, dataset=args.dataset, seed=args.seed,
+                                           loss_tag=args.preset), final)
+                    log(f"[RECOVERY] Updated BEST at epoch {best_epoch} from latest")
+                del best_meta
         log(f"[RESUMED] starting epoch {start_epoch}; best_val_mAP={best_map:.5f}")
         del ck
 
@@ -287,11 +314,6 @@ def run_single(args):
         improved = bool(np.isfinite(val_map) and val_map > best_map)
         if improved:
             best_map, best_epoch = val_map, epoch
-            atomic_torch_save(dict(model_state=model.state_dict(),
-                                   epoch=epoch, best_val_map=best_map,
-                                   validation=val, config=signature,
-                                   dataset=args.dataset, seed=args.seed,
-                                   loss_tag=args.preset), best)
         vram = round(torch.cuda.max_memory_allocated(device) / 1024**3, 3) if device.type == "cuda" else 0.
         row = dict(dataset=args.dataset, loss_tag=args.preset, seed=args.seed,
                    epoch=epoch, train_loss=result.loss,
@@ -305,55 +327,62 @@ def run_single(args):
         payload = dict(epoch=epoch, model_state=model.state_dict(),
                        optimizer_state=optimizer.state_dict(), scaler_state=scaler.state_dict(),
                        signature=signature, best_val_map=best_map, best_epoch=best_epoch,
+                       validation=val,
                        rng_torch=torch.get_rng_state(), rng_numpy=np.random.get_state(),
                        rng_python=random.getstate(),
                        rng_cuda=torch.cuda.get_rng_state_all() if device.type == "cuda" else None,
                        epoch_row=row)
+        # Temporary latest for resume; BEST is the only published checkpoint.
         atomic_torch_save(payload, latest)
+        if improved:
+            # Only ONE published model checkpoint per loss. Atomic replacement means
+            # earlier best weights remain intact if interrupted during writing.
+            atomic_torch_save(dict(model_state=payload["model_state"],
+                                   epoch=epoch, best_val_map=best_map,
+                                   validation=val, config=signature,
+                                   dataset=args.dataset, seed=args.seed,
+                                   loss_tag=args.preset), final)
+            log(f"[BEST UPDATED] epoch={epoch}, Val mAP={best_map:.5f}: {final}")
         append_csv(history, row)
         log(f"[EPOCH DONE] {epoch}/{args.epochs} | Val mAP={val_map:.5f} | "
             f"best={best_map:.5f} (epoch {best_epoch}) | VRAM_peak={vram:.2f} GiB | "
             f"{row['epoch_seconds']}s")
 
-    if not best.is_file():
-        raise RuntimeError("No finite Validation mAP; refusing to export a BEST checkpoint")
-    ck = torch.load(best, map_location="cpu", weights_only=False)
+    if not final.is_file():
+        raise RuntimeError("No finite Validation mAP; refusing to finalize without a BEST checkpoint")
+    ck = torch.load(final, map_location="cpu", weights_only=False)
     if ck.get("config") != signature or ck.get("epoch") != best_epoch:
-        raise RuntimeError("Final best checkpoint metadata mismatch")
-    tmp_final = final.with_suffix(".pth.writing")
-    final.parent.mkdir(parents=True, exist_ok=True)
-    if tmp_final.exists():
-        tmp_final.unlink()
-    shutil.copyfile(best, tmp_final)
-    if tmp_final.stat().st_size != best.stat().st_size:
-        tmp_final.unlink()
-        raise IOError("Incomplete BEST checkpoint copy")
-    os.replace(tmp_final, final)
+        raise RuntimeError("Final BEST checkpoint metadata mismatch")
+    del ck
     log(f"[BEST] {final} | best epoch {best_epoch}/{args.epochs}, Val mAP={best_map:.5f}")
-    # Save per-epoch data as one independent flat CSV (no nested CSV directories).
-    rows = read_history(history)
-    for entry in rows:
-        append_csv(report_path, entry)
+    # Commit one run CSV atomically (not duplicated on interrupted export).
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_tmp = report_path.with_suffix(".csv.writing")
+    shutil.copyfile(history, report_tmp)
+    os.replace(report_tmp, report_path)
     atomic_json_save(dict(dataset=args.dataset, seed=args.seed, loss_tag=args.preset,
                           best_epoch=best_epoch, best_val_mAP=best_map,
-                          checkpoint=str(final), complete=True),
-                     root / "csv" / f"{args.dataset}_{args.preset}_seed{args.seed}_summary.json")
+                          checkpoint=str(final), complete=True, signature=signature), summary_path)
     shutil.rmtree(work)
-    log("[DONE] Only one published BEST .pth; temporary resume files cleared")
+    log(f"[DONE] {args.dataset} {args.preset} seed{args.seed}: ONE BEST .pth published; temporary resume checkpoint removed")
+    return "completed"
 
 
 def build_parser():
-    p = argparse.ArgumentParser(description="Local Stage 2: full 14 Loss + SupCon x 5 seeds x 2 datasets")
-    p.add_argument("--data-root", type=Path, default=Path("data/processed"))
-    p.add_argument("--output-root", type=Path, default=Path("outputs/stage2"))
-    p.add_argument("--dataset", choices=("all", *DATASETS), default="all")
+    p = argparse.ArgumentParser(
+        description="Stage 2: one VinDr dataset + one seed, 14 original Loss presets + Momentum SupCon"
+    )
+    p.add_argument("--dataset", choices=DATASETS, default="VinDr-PCXR")
+    p.add_argument("--seed", type=int, choices=SEEDS, default=7)
     p.add_argument("--preset", choices=("all", *PRESETS), default="all")
-    p.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
+    p.add_argument("--data-dir", type=Path, default=None,
+                   help="Override the selected local dataset path (default: ../data/processed/<dataset>).")
+    p.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     p.add_argument("--epochs", type=int, default=15)
-    p.add_argument("--batch-size", type=int, default=8)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--val-batch-size", type=int, default=8)
-    p.add_argument("--accumulation-steps", type=int, default=4)
-    p.add_argument("--num-workers", type=int, default=0, help="Windows safest: 0")
+    p.add_argument("--accumulation-steps", type=int, default=1)
+    p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--image-size", type=int, default=512)
     p.add_argument("--queue-size", type=int, default=1024)
     p.add_argument("--proj-dim", type=int, default=128)
@@ -365,87 +394,46 @@ def build_parser():
     p.add_argument("--progress-every", type=int, default=10)
     p.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     p.add_argument("--no-amp", action="store_true")
-    p.add_argument("--no-pretrained", action="store_true", help="Debug only, not comparable to ImageNet experiment")
-    p.add_argument("--resume", action="store_true", help="Resume partial run from local _work/latest.pth")
-    p.add_argument("--auto-resume", action="store_true", help="Outer loop resumes partial runs automatically")
-    p.add_argument("--discard-partial", action="store_true", help="Explicitly discard only this run's local temporary state")
-    p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--confirm-overwrite", action="store_true")
-    p.add_argument("--list", action="store_true", help="Print plan and presets only")
-    p.add_argument("--single", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-pretrained", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                   help="Continue each loss from last complete epoch; start new losses from epoch 1")
+    p.add_argument("--discard-partial", action="store_true", help="Disabled for safety")
+    p.add_argument("--overwrite", action="store_true", help="Disabled for safety")
+    p.add_argument("--confirm-overwrite", action="store_true", help="Disabled for safety")
+    p.add_argument("--list", action="store_true", help="Show 14 original presets and exit")
     return p
 
 
-def main():
-    args = build_parser().parse_args()
-    if any(x <= 0 for x in (args.epochs, args.batch_size, args.val_batch_size,
-                            args.accumulation_steps, args.image_size, args.queue_size,
-                            args.progress_every)):
-        raise ValueError("Epoch, batch, accumulation, size, queue, progress must be positive")
-    if not 0 < args.temperature <= 1 or args.beta < 0 or not 0 <= args.momentum < 1:
-        raise ValueError("Invalid temperature, beta or momentum")
-    if len(set(args.seeds)) != len(args.seeds):
-        raise ValueError("Duplicate seed IDs")
-    plan = [(d, p, s) for d in (DATASETS if args.dataset == "all" else [args.dataset])
-            for p in (PRESETS if args.preset == "all" else [args.preset])
-            for s in args.seeds]
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if any(v <= 0 for v in (args.epochs, args.batch_size, args.val_batch_size,
+                             args.accumulation_steps, args.image_size, args.queue_size,
+                             args.progress_every)):
+        raise ValueError("Epochs/batches/queue/image_size/progress_every must be positive")
+    if args.num_workers < 0 or not 0 < args.temperature <= 1 or args.beta < 0 or not 0 <= args.momentum < 1:
+        raise ValueError("Invalid num_workers, temperature, beta, or momentum")
+    if args.discard_partial or args.overwrite or args.confirm_overwrite:
+        raise ValueError("Destructive options disabled; archive old results manually before rerunning")
+    names = list(PRESETS) if args.preset == "all" else [args.preset]
+    log(f"[PLAN] dataset={args.dataset} | seed={args.seed} | {len(names)} Loss | "
+        f"batch={args.batch_size} accum={args.accumulation_steps} | SupCon batch={args.batch_size}")
+    log(f"[PATH] data={(args.data_dir or DATASET_PATHS[args.dataset]).resolve()}")
+    log(f"[PATH] output={args.output_root.resolve()}")
     if args.list:
-        for i, (d,p,s) in enumerate(plan, 1):
-            log(f"[PLAN] {i:03}/{len(plan):03} {d} {p} seed{s} {PRESETS[p]}")
-        log(f"[TOTAL] {len(plan)} runs. Default batch={args.batch_size} x accum={args.accumulation_steps} (SupCon sees {args.batch_size} per batch)")
+        for index, key in enumerate(names, 1):
+            log(f"[PRESET] {index:02}/{len(names):02} {key}: {PRESETS[key]}")
         return 0
-    if args.single:
-        if len(plan) != 1:
-            raise ValueError("Internal --single requires exactly one dataset, preset and seed")
+    for i, preset in enumerate(names, 1):
+        args.preset = preset
+        log(f"\n[LOSS {i:02}/{len(names):02}] {args.dataset} seed{args.seed} {preset}")
         run_single(args)
-        return 0
-
-    script = Path(__file__).resolve()
-    log(f"[START] {len(plan)} run(s), output={args.output_root.resolve()}")
-    log(f"[CONFIG] batch={args.batch_size} accum={args.accumulation_steps} | "
-        f"SupCon per-batch positives based on actual batch={args.batch_size}")
-    for index, (dataset, preset, seed) in enumerate(plan, 1):
-        output = args.output_root.resolve()
-        best = output / "checkpoints" / dataset / f"seed{seed}" / f"best_{preset}_supcon_seed{seed}.pth"
-        if best.exists() and not args.overwrite:
-            log(f"[SKIP] {index}/{len(plan)} {dataset} {preset} seed{seed}: BEST exists")
-            continue
-        work_latest = output / "_work" / dataset / preset / f"seed{seed}" / "latest.pth"
-        cmd = [sys.executable, "-u", str(script), "--single", "--dataset", dataset,
-               "--preset", preset, "--seeds", str(seed)]
-        # Forward only known args without duplicating selected dimensions.
-        for flag, value in (("--data-root", args.data_root), ("--output-root", args.output_root),
-                            ("--epochs", args.epochs), ("--batch-size", args.batch_size),
-                            ("--val-batch-size", args.val_batch_size),
-                            ("--accumulation-steps", args.accumulation_steps),
-                            ("--num-workers", args.num_workers), ("--image-size", args.image_size),
-                            ("--queue-size", args.queue_size), ("--proj-dim", args.proj_dim),
-                            ("--momentum", args.momentum), ("--temperature", args.temperature),
-                            ("--beta", args.beta), ("--lr", args.lr),
-                            ("--weight-decay", args.weight_decay),
-                            ("--progress-every", args.progress_every), ("--device", args.device)):
-            cmd.extend((flag, str(value)))
-        for flag in ("no_amp", "no_pretrained", "overwrite", "confirm_overwrite"):
-            if getattr(args, flag):
-                cmd.append("--" + flag.replace("_", "-"))
-        if args.discard_partial:
-            cmd.append("--discard-partial")
-        elif args.resume or (args.auto_resume and work_latest.is_file()):
-            cmd.append("--resume")
-        log(f"\n[RUN] {index}/{len(plan)} {dataset} {preset} seed{seed}")
-        ret = subprocess.run(cmd, cwd=str(script.parent), check=False)
-        if ret.returncode:
-            log(f"[FAILED] {dataset} {preset} seed{seed} | exit={ret.returncode}")
-            log(f"[RECOVER] After addressing the error, use --auto-resume to resume completed epochs.")
-            return ret.returncode
-        gc.collect()
-    log(f"[DONE] All selected run(s) processed. Check {args.output_root.resolve() / 'checkpoints'}")
+    log(f"[ALL DONE] Completed or skipped {len(names)} presets for {args.dataset} seed{args.seed}")
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    except Exception as exc:
+        log(f"[FAILED] {type(exc).__name__}: {exc}")
+        raise
